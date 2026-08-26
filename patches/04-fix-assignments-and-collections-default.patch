@@ -1,0 +1,120 @@
+diff --git a/app/src/main/java/eu/faircode/xlua/AdapterGroup.java b/app/src/main/java/eu/faircode/xlua/AdapterGroup.java
+index 0d0fabd..159c7ed 100644
+--- a/app/src/main/java/eu/faircode/xlua/AdapterGroup.java
++++ b/app/src/main/java/eu/faircode/xlua/AdapterGroup.java
+@@ -58,6 +58,9 @@ import eu.faircode.xlua.ui.interfaces.ILoader;
+ import eu.faircode.xlua.utilities.SettingUtil;
+ import eu.faircode.xlua.x.Str;
+ import eu.faircode.xlua.x.data.utils.TryRun;
++import eu.faircode.xlua.x.xlua.commands.call.AssignHooksCommand;
++import eu.faircode.xlua.x.xlua.database.A_CODE;
++import eu.faircode.xlua.x.xlua.hook.AssignmentsPacket;
+ import eu.faircode.xlua.x.ui.adapters.hooks.elements.XHook;
+ import eu.faircode.xlua.x.ui.dialogs.HookInfoDialog;
+ import eu.faircode.xlua.x.xlua.LibUtil;
+@@ -66,6 +69,7 @@ import eu.faircode.xlua.x.xlua.hook.AppXpPacket;
+ 
+ 
+ public class AdapterGroup extends RecyclerView.Adapter<AdapterGroup.ViewHolder> implements IDividerKind {
++    private static final String TAG = "XLua.AdapterGroup";
+     private AppXpPacket app;
+     private List<LuaHooksGroup> groups = new ArrayList<>();
+     private ILoader fragmentLoader;
+@@ -194,7 +198,41 @@ public class AdapterGroup extends RecyclerView.Adapter<AdapterGroup.ViewHolder>
+                                     .show(fragmentLoader.getManager(), compoundButton.getContext().getString(R.string.title_hook_warning));
+                     }
+ 
+-                    app.setAssigned(compoundButton.getContext(), group.name, checked);
++                    // BUG FIX: app.setAssigned(...) used to call through to AppXpPacket.onAssign, a
++                    // listener that is NEVER SET anywhere in the whole codebase (setListener() exists
++                    // but nothing ever calls it) - so toggling this checkbox visually flipped, but no
++                    // save ever happened at all. That's why the state "reset" on every refresh/reopen:
++                    // there was nothing persisted to reset FROM in the first place. Call the real save
++                    // command directly instead.
++                    final Context ctx = compoundButton.getContext();
++                    final List<String> hookIds = new ArrayList<>();
++                    for (XHook h : group.hooks)
++                        if (h != null && !Str.isEmpty(h.getObjectId()))
++                            hookIds.add(h.getObjectId());
++
++                    if (!hookIds.isEmpty() && app != null) {
++                        AssignmentsPacket packet = AssignmentsPacket.create(
++                                app.uid,
++                                app.packageName,
++                                hookIds,
++                                !checked, // delete=true when unchecking, push/add when checking
++                                false);
++
++                        A_CODE result = AssignHooksCommand.call(ctx, packet);
++                        if (result != A_CODE.SUCCESS)
++                            Log.e(TAG, "Failed to save hook assignment! app=" + app.packageName +
++                                    " group=" + group.name + " checked=" + checked + " result=" + result);
++                        else if (BuildConfig.DEBUG)
++                            Log.i(TAG, "Saved hook assignment: app=" + app.packageName +
++                                    " group=" + group.name + " checked=" + checked + " hookCount=" + hookIds.size());
++
++                        // Keep this call too (harmless no-op today, but free if setListener() is ever
++                        // wired up) and update the in-memory group/assignment counters so the rest of
++                        // the UI (badges, "assigned" totals) reflects the change without a full reload.
++                        group.assigned = checked ? group.hooks.size() : 0;
++                    }
++
++                    app.setAssigned(ctx, group.name, checked);
+                     break;
+             }
+         }
+@@ -206,7 +244,7 @@ public class AdapterGroup extends RecyclerView.Adapter<AdapterGroup.ViewHolder>
+     @SuppressLint("NotifyDataSetChanged")
+     void set(AppXpPacket app, List<XHook> hooks, Context context, IFinished onFinished) {
+         this.app = app;
+-        TryRun.silent(() -> {
++        TryRun.log(() -> {
+             Map<String, LuaHooksGroup> map = new HashMap<>();
+             for (XHook hook : hooks) {
+                 if(!Str.isEmpty(hook.group) &&
+diff --git a/app/src/main/java/eu/faircode/xlua/x/xlua/commands/call/GetSettingExCommand.java b/app/src/main/java/eu/faircode/xlua/x/xlua/commands/call/GetSettingExCommand.java
+index e54cd3e..7183aaa 100644
+--- a/app/src/main/java/eu/faircode/xlua/x/xlua/commands/call/GetSettingExCommand.java
++++ b/app/src/main/java/eu/faircode/xlua/x/xlua/commands/call/GetSettingExCommand.java
+@@ -36,16 +36,10 @@ public class GetSettingExCommand extends CallCommandHandlerEx {
+     public static final String SETTING_VERBOSE_DEBUG = "verbose_debug_logs";
+     public static final String SETTING_SELECTED_CONFIG = "selected_config";
+ 
+-    // BUG: this was just "PrivacyEx". The base built-in hooks in assets/hooks.json (and its
+-    // sub-folders) are tagged "collection":"Privacy" (see e.g. assets/hooks.json), while only a
+-    // smaller subset use "PrivacyEx". The legacy/old system's equivalent default was
+-    // "Privacy,PrivacyEx" (see LuaSettingsManager.DEFAULT_COLLECTIONS) - somewhere during the
+-    // migration to this new settings system the "Privacy," part got dropped from the default.
+-    // Effect: on every fresh install/db, XHook.isAvailable(...) rejects almost every built-in hook
+-    // because its "collection" isn't in the (wrongly short) default enabled-collections list, so
+-    // the Collections dialog looks empty of *effect* and hooks never show as "applied" to any app
+-    // in the expanded app row, even though the hooks themselves loaded fine.
+-    public static final String SETTING_COLLECTION_DEFAULT = "Privacy,PrivacyEx";
++    // CONFIRMED via logcat from the original (rooted+Xposed) XPL-EX: "Set collections=1 ..." - i.e.
++    // exactly ONE collection enabled by default, and it's "PrivacyEx". My earlier change to
++    // "Privacy,PrivacyEx" here was WRONG - reverted back to match the real, confirmed default.
++    public static final String SETTING_COLLECTION_DEFAULT = "PrivacyEx";
+     public static final String SETTING_THEME_DEFAULT = "dark";
+ 
+ 
+diff --git a/app/src/main/java/eu/faircode/xlua/x/xlua/hook/AppProviderUtils.java b/app/src/main/java/eu/faircode/xlua/x/xlua/hook/AppProviderUtils.java
+index 06b95b9..af4bacf 100644
+--- a/app/src/main/java/eu/faircode/xlua/x/xlua/hook/AppProviderUtils.java
++++ b/app/src/main/java/eu/faircode/xlua/x/xlua/hook/AppProviderUtils.java
+@@ -174,7 +174,15 @@ public class AppProviderUtils {
+ 
+         //We can check collections
+         List<AssignmentPacket> assignments = new ArrayList<>();
+-        if(apps.size() == 48543)  {
++        // BUG FIX: this was "apps.size() == 48543" - a magic number that can (for all practical
++        // purposes) never be true, given the comment right below explicitly says "Is Single App for
++        // Init Assignments". This made the single-app path (used by AppProviderApi.getApp(), i.e.
++        // expanding/looking up one specific app) always fall through to the "else" (bulk/all-apps)
++        // branch instead, which queries by a UID *range* rather than this app's exact package name -
++        // for a map that deliberately contains only one entry, that's a much more expensive query for
++        // no benefit, and depending on the exact uid range computed it could also miss/mismatch the
++        // entry entirely. Was clearly meant to be a single-app check.
++        if(apps.size() == 1)  {
+             AppXpPacket app = ListUtil.copyToArrayList(apps.values()).get(0);
+             if(DebugUtil.isDebug())
+                 Log.d(TAG, Str.fm("Is Single App for Init Assignments, App Pkg=%s UserId=%s",

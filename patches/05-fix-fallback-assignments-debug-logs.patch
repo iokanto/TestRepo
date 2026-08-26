@@ -1,0 +1,136 @@
+diff --git a/app/src/main/java/eu/faircode/xlua/XLegacyCore.java b/app/src/main/java/eu/faircode/xlua/XLegacyCore.java
+index a9f0bee..c0145f3 100644
+--- a/app/src/main/java/eu/faircode/xlua/XLegacyCore.java
++++ b/app/src/main/java/eu/faircode/xlua/XLegacyCore.java
+@@ -73,6 +73,7 @@ public class XLegacyCore {
+     final static String cChannelName = "xlua";
+ 
+     public static List<String> getCollections(SQLDatabase database) { return database == null ? ListUtil.emptyList() : database.executeWithWriteLock(() -> SettingsApi.getCollectionsValue(database, UserIdentityUtils.getUserId(Binder.getCallingUid()))); }
++    public static boolean hasBuiltInHooksLoaded() { synchronized (lock) { return !hooks.isEmpty(); } }
+ 
+     public static void clear(boolean flag) { if(flag) clear(); }
+     public static void clear() { synchronized (lock) { internalClear(true); } }
+@@ -521,8 +522,20 @@ public class XLegacyCore {
+             boolean marshall) {
+         synchronized (lock) {
+             XHook hook = hooks.get(hookId);
+-            if(hook == null)
++            if(hook == null) {
++                // Debug-only: this is the exact code path used by the gear-icon / "assigned hooks"
++                // screen (GetAssignedHooksExCommand -> writeHookFromCache), which is a completely
++                // separate implementation from initAppsAssignmentSettings (used by the main app list
++                // refresh). It silently returned here with zero logging before - if the assignment
++                // read-back genuinely has the row (confirmed via AssignmentApi.getAssignments logging)
++                // but this lookup misses, we need to know whether it's because the in-memory hook
++                // cache isn't loaded yet (hooksLoadedCount=0) or because this specific hookId just
++                // isn't in it (typo/case mismatch/stale id) despite hooks being loaded otherwise.
++                if (DebugUtil.isDebug())
++                    Log.w(TAG, Str.fm("writeHookFromCache: hook NOT found in cache for hookId=%s package=%s hooksLoadedCount=%s",
++                            hookId, packageName, hooks.size()));
+                 return;
++            }
+ 
+             try {
+                 if(hook.isAvailable(packageName, collections)) {
+@@ -538,6 +551,13 @@ public class XLegacyCore {
+                                 .add(hook.toJSON())
+                                 .add(used);
+                     }
++                } else {
++                    // Debug-only: hook was found in cache but was rejected by the collections check -
++                    // this pinpoints a collections mismatch specifically (as opposed to a missing-hook
++                    // /timing issue, which is logged above instead).
++                    if (DebugUtil.isDebug())
++                        Log.w(TAG, Str.fm("writeHookFromCache: hook found but NOT available. hookId=%s package=%s hookCollection=%s enabledCollections=%s",
++                                hookId, packageName, hook.collection, Str.joinList(collections)));
+                 }
+             }catch (Exception e) {
+                 Log.e(TAG, Str.fm("Error Writing Hook From Cache! HookId=(%s) Error=%s",
+diff --git a/app/src/main/java/eu/faircode/xlua/x/xlua/hook/AppProviderUtils.java b/app/src/main/java/eu/faircode/xlua/x/xlua/hook/AppProviderUtils.java
+index af4bacf..1ebc8d1 100644
+--- a/app/src/main/java/eu/faircode/xlua/x/xlua/hook/AppProviderUtils.java
++++ b/app/src/main/java/eu/faircode/xlua/x/xlua/hook/AppProviderUtils.java
+@@ -211,9 +211,14 @@ public class AppProviderUtils {
+                     userId,
+                     Str.joinList(collections)));
+ 
++        int droppedAppNull = 0;
++        int droppedHookNull = 0;
++        int matched = 0;
++
+         for(AssignmentPacket assignment : assignments) {
+             AppXpPacket app = apps.get(assignment.getCategory());
+             if(app == null) {
++                droppedAppNull++;
+                 if(DebugUtil.isDebug()) Log.e(TAG, "Assignment App is Null, Category=" + assignment.getCategory());
+                 continue;
+             }
+@@ -234,15 +239,24 @@ public class AppProviderUtils {
+                     assignment.getCategory(),
+                     collections);
+             if(hook == null) {
+-                if(DebugUtil.isDebug())
+-                    Log.d(TAG, Str.fm("Hook Is NULL for Assignment, Hook=%s  Category=%s  User Id=%s  Collection Size=%s",
++                droppedHookNull++;
++                // Debug-only - this is the exact spot where a correctly-saved, correctly-read-back
++                // assignment row can still end up invisible in the UI: XLegacyCore.getHook(id, pkg,
++                // collections) returns null both when the hook id genuinely isn't in the in-memory
++                // hook cache (e.g. hooks haven't finished loading yet - a startup timing race) AND
++                // when hook.isAvailable(pkg, collections) rejects it (a collections mismatch).
++                // Logging which one it is removes the guesswork.
++                if (DebugUtil.isDebug())
++                    Log.w(TAG, Str.fm("Assignment dropped - hook lookup returned null. Hook=%s Category=%s UserId=%s Collections=%s hooksLoaded=%s",
+                             assignment.getHookId(),
+                             assignment.getCategory(),
+                             userId,
+-                            ListUtil.size(collections)));
++                            Str.joinList(collections),
++                            XLegacyCore.hasBuiltInHooksLoaded()));
+                 continue;
+             }
+ 
++            matched++;
+             if(DebugUtil.isDebug())
+                 Log.d(TAG, Str.fm("Found the Hook for Assignment, ID=%s  User ID=%s",
+                         assignment.getHookId(),
+@@ -251,5 +265,13 @@ public class AppProviderUtils {
+             assignment.setHook(hook);
+             app.addAssignment(assignment);
+         }
++
++        if (DebugUtil.isDebug())
++            Log.i(TAG, Str.fm("Finished matching assignments to hooks. total=%s matched=%s droppedAppNull=%s droppedHookNull=%s collections=%s",
++                    ListUtil.size(assignments),
++                    matched,
++                    droppedAppNull,
++                    droppedHookNull,
++                    Str.joinList(collections)));
+     }
+ }
+diff --git a/app/src/main/java/eu/faircode/xlua/x/xlua/hook/AssignmentApi.java b/app/src/main/java/eu/faircode/xlua/x/xlua/hook/AssignmentApi.java
+index 36f122a..c32722a 100644
+--- a/app/src/main/java/eu/faircode/xlua/x/xlua/hook/AssignmentApi.java
++++ b/app/src/main/java/eu/faircode/xlua/x/xlua/hook/AssignmentApi.java
+@@ -142,10 +142,21 @@ public class AssignmentApi {
+         if(DebugUtil.isDebug())
+             Log.d(TAG, "DB=" + Str.toStringOrNull(db) + " User Id=" + userId + " Category=" + category);
+ 
+-        return SQLSnake.create(db, AssignmentPacket.TABLE_NAME)
++        List<AssignmentPacket> result = SQLSnake.create(db, AssignmentPacket.TABLE_NAME)
+                 .ensureDatabaseIsReady()
+                 .whereIdentity(userId, category)
+                 .asSnake()
+                 .queryAs(AssignmentPacket.class, true, false);
++
++        // Debug-only - this is exactly the read-back path used to restore checkbox state on every
++        // app list load / reopen. If this logs 0 here right after a save that inserted N rows, the
++        // data genuinely isn't there anymore (wrong table/db file, or something really did wipe
++        // it) - if it logs N here but the UI still shows unchecked, the bug is downstream in
++        // AppProviderUtils/AdapterGroup instead.
++        if (DebugUtil.isDebug())
++            Log.i(TAG, "getAssignments RESULT userId=" + userId + " category=" + category +
++                    " rows=" + ListUtil.size(result));
++
++        return result;
+     }
+ }

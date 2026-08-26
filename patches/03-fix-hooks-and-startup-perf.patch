@@ -1,0 +1,923 @@
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 6f684ad..f995951 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -166,6 +166,18 @@
+                 android:value=".ActivityMain" />
+         </activity>
+ 
++        <!--
++            NOTE: android:process=":vxp" is back. Removing it in a previous attempt caused the app
++            to crash on cold start - putting this provider in the main process makes Android
++            instantiate it eagerly, very early during process startup (before Application.onCreate()
++            finishes, before whatever LSPatch itself needs to set up is guaranteed ready), and that's
++            too fragile. Keeping a separate process is the safe, conservative choice.
++            The actual fix for "Hooks/Collections empty" no longer depends on this provider working at
++            all for our OWN UI - see XProxyContent.java, which now talks to GlobalCommandBridge
++            directly, in-process, without going through this ContentProvider/Binder/URI machinery.
++            This provider is kept only for the (separate, external) use case of other HPatch/LSPatch
++            -patched apps reading hook/collection data from this app across process boundaries.
++        -->
+         <provider
+             android:name=".VXP"
+             android:exported="true"
+diff --git a/app/src/main/java/eu/faircode/xlua/ReceiverPackage.java b/app/src/main/java/eu/faircode/xlua/ReceiverPackage.java
+index 4df1205..8530325 100644
+--- a/app/src/main/java/eu/faircode/xlua/ReceiverPackage.java
++++ b/app/src/main/java/eu/faircode/xlua/ReceiverPackage.java
+@@ -123,7 +123,7 @@ public class ReceiverPackage extends BroadcastReceiver {
+             }
+         } catch (Throwable ex) {
+             Log.e(TAG, Log.getStackTraceString(ex));
+-            XposedBridge.log(ex);
++            eu.faircode.xlua.SafeXposed.log(ex);
+         }
+     }
+ }
+diff --git a/app/src/main/java/eu/faircode/xlua/SafeXposed.java b/app/src/main/java/eu/faircode/xlua/SafeXposed.java
+new file mode 100644
+index 0000000..28fc963
+--- /dev/null
++++ b/app/src/main/java/eu/faircode/xlua/SafeXposed.java
+@@ -0,0 +1,49 @@
++package eu.faircode.xlua;
++
++/**
++ * Confirmed by logcat: in this build, "de.robv.android.xposed.XposedBridge" does not exist
++ * anywhere in the apk's classpath at all -
++ *   java.lang.ClassNotFoundException: Didn't find class "de.robv.android.xposed.XposedBridge"
++ *   on path: DexPathList[[zip file ".../base.apk"], ...]
++ * The codebase calls XposedBridge.log(...) unconditionally in dozens of places, including deep
++ * inside database/hook initialization (XLuaDatabaseManager, XLegacyCore's own log wrappers, etc).
++ * Any one of those calls throws NoClassDefFoundError the first time it's reached, which is why the
++ * "settings"/"hook" tables were never even created ("no such table: settings" in logcat) and the
++ * Hooks list stayed empty - not because of a routing/process/parsing problem, but because
++ * initialization was crashing before it got anywhere near that code.
++ * <p>
++ * This class centralizes every one of those call sites behind a single, cheap, one-time
++ * availability check. If XposedBridge really is available (e.g. this same code running inside an
++ * actually-hooked target app's process under a real Xposed/LSPatch module load), it behaves
++ * exactly as before. If it isn't, every call becomes a harmless no-op instead of a crash.
++ */
++public final class SafeXposed {
++    private SafeXposed() {}
++
++    private static final boolean AVAILABLE = checkAvailable();
++
++    private static boolean checkAvailable() {
++        try {
++            Class.forName("de.robv.android.xposed.XposedBridge");
++            return true;
++        } catch (Throwable t) {
++            return false;
++        }
++    }
++
++    public static boolean isAvailable() { return AVAILABLE; }
++
++    public static void log(String msg) {
++        if (!AVAILABLE) return;
++        try {
++            de.robv.android.xposed.XposedBridge.log(msg);
++        } catch (Throwable ignored) { }
++    }
++
++    public static void log(Throwable ex) {
++        if (!AVAILABLE) return;
++        try {
++            de.robv.android.xposed.XposedBridge.log(ex);
++        } catch (Throwable ignored) { }
++    }
++}
+diff --git a/app/src/main/java/eu/faircode/xlua/XLegacyCore.java b/app/src/main/java/eu/faircode/xlua/XLegacyCore.java
+index ad56bd0..a9f0bee 100644
+--- a/app/src/main/java/eu/faircode/xlua/XLegacyCore.java
++++ b/app/src/main/java/eu/faircode/xlua/XLegacyCore.java
+@@ -88,6 +88,19 @@ public class XLegacyCore {
+         }
+     }
+ 
++    // The DB-schema "init" flag in XLuaDatabaseManager/XLuaDatabase is (and should stay) a one-shot flag.
++    // But initializeFromJsons() can silently fail (bad apk path, IO hiccup, ...) and previously that flag
++    // being set to true BEFORE calling initializeFromJsons meant a failure there would leave the built-in
++    // Hooks list empty for the entire lifetime of the process, with no way to recover short of a restart.
++    // This lets any caller cheaply re-attempt the JSON/asset load as long as the in-memory cache is empty,
++    // without re-running the (comparatively expensive) DB schema upgrade logic every time.
++    public static boolean ensureHooksLoaded(Context context, SQLDatabase database) {
++        if(hooks.isEmpty())
++            initializeFromJsons(context, database, false);
++
++        return !hooks.isEmpty();
++    }
++
+     //ToDO: SINCE we re-vamped the Hook System now, we no longer have to juggle, we can just make what our heart desires. IN that case we need to make a Global "Assignemtns" thingy the "10/10" Hooks asigned thing
+     //  Lets ensure it is shared and synced attached to events to and when needing to update
+ 
+@@ -101,6 +114,12 @@ public class XLegacyCore {
+     public static boolean updateHookCache(Context context, XHook hook, String extraId, boolean flag) { return flag && updateHookCache(context, hook, extraId); }
+     public static boolean updateHookCache(Context context, XHook hook, String extraId) { synchronized (lock) { return internalUpdateHookCache(context, hook, extraId, null); } }
+ 
++    // Simple, always-on (not gated behind DebugUtil.isDebug()) diagnostic snapshot of the last
++    // built-in hook load attempt, so this can be surfaced directly in the UI (Toast/dialog) without
++    // needing adb/logcat access at all.
++    private static volatile String lastHookLoadDiagnostics = "no attempt yet";
++    public static String getLastHookLoadDiagnostics() { return lastHookLoadDiagnostics; }
++
+     public static void initializeFromJsons(Context context, SQLDatabase database, boolean clearCache) {
+         if(DatabaseUtils.isReady(database)) {
+             logI(Str.fm("Initializing Hooks from JSONs, Cache [%s::%s] Total Count=(%s) Cycles=(%s) Clear Cache=%s Database=%s",
+@@ -112,33 +131,75 @@ public class XLegacyCore {
+                     Str.toStringOrNull(database)));
+ 
+             synchronized (lock) {
+-                TryRun.silent(() -> {
++                // Was TryRun.silent(...) before - that swallowed ANY exception with zero logging,
++                // which is exactly why an empty Hooks list produced no visible error anywhere.
++                // Switched to TryRun.log so a real failure (bad apk path, IO error, etc.) actually
++                // shows up in logcat under tag "XLua.TryRun" / "XLegacyCore".
++                TryRun.log(() -> {
++                  try {
+                     internalClear(clearCache);
+                     totalCycles++;
+                     PackageManager pm = context.getPackageManager();
+                     if(pm == null) {
++                        lastHookLoadDiagnostics = "FAILED: PackageManager was null";
+                         logE("Failed to connect to Package Manager Service! Error Initializing Hooks from JSONs! Stack=" + RuntimeUtils.getStackTraceSafeString(new Exception()));
+                         return;
+                     }
+ 
+                     //INCREMENT CYCLES
+                     //Consider my OBC Scripts Built In ?
+-                    ApplicationInfo ai = pm.getApplicationInfo(BuildConfig.APPLICATION_ID, 0);
++                    // Prefer our own installed package (works regardless of how LSPatch renamed/kept the
++                    // package id), fall back to BuildConfig.APPLICATION_ID for the classic rooted/Xposed case.
++                    ApplicationInfo ai;
++                    try {
++                        ai = pm.getApplicationInfo(context.getPackageName(), 0);
++                    } catch (Throwable ignoredSelf) {
++                        ai = pm.getApplicationInfo(BuildConfig.APPLICATION_ID, 0);
++                    }
++
+                     List<XHook> hooksParsed = XHookJsonUtils.readHooks(context, ai.publicSourceDir);
++                    String source = "zip(" + ai.publicSourceDir + ")";
++                    if(!ListUtil.isValid(hooksParsed)) {
++                        // The ZipFile(ai.publicSourceDir) approach exists because, on rooted/real-Xposed,
++                        // this code can run while hooked *inside a completely different app's process*,
++                        // where context.getAssets() would return THAT app's assets, not ours. In the
++                        // rootless/VXP (self-hosted ContentProvider) case this code always runs inside our
++                        // OWN process, so context.getAssets() is a perfectly valid - and more robust -
++                        // fallback if reading the on-disk apk file directly returned nothing (e.g. because
++                        // the LSPatch-produced apk path/layout wasn't what we expected).
++                        logW(TAG, Str.fm("readHooks(apk=%s) returned 0 hooks, falling back to context.getAssets()", ai.publicSourceDir), false);
++                        hooksParsed = XHookJsonUtils.readHooksFromAssets(context);
++                        source = "context.getAssets() fallback";
++                    }
++
+                     if(DebugUtil.isDebug())
+                         logD(Str.fm("Finished Reading Apk Assets JSON Hooks! Parsed Hooks Count=(%s) Database=%s Clear Cache=%s",
+                                 ListUtil.size(hooksParsed),
+                                 Str.toStringOrNull(database),
+                                 clearCache));
+ 
++                    int validCount = 0;
++                    int invalidCount = 0;
++                    List<String> invalidSamples = new ArrayList<>();
++
+                     for (XHook hook : hooksParsed) {
+                         if(hook.isValid()) {
+                             hook.builtin = true;
+                             hooks.put(hook.getObjectId(), hook);
+                             builtIn.put(hook.getObjectId(), hook);  //Auto Assume if it is From the JSON Files, it is a built in Hook for now later we can expand on this
++                            validCount++;
++                        } else {
++                            invalidCount++;
++                            if(invalidSamples.size() < 5)
++                                invalidSamples.add(Str.fm("name='%s' collection='%s'", hook.name, hook.collection));
+                         }
+                     }
+ 
++                    lastHookLoadDiagnostics = Str.fm(
++                            "source=%s parsed=%s valid=%s invalid=%s cacheAfter=%s invalidSamples=%s",
++                            source, ListUtil.size(hooksParsed), validCount, invalidCount, hooks.size(), invalidSamples);
++                    logI(TAG, "Hook Load Diagnostics: " + lastHookLoadDiagnostics, false);
++
+                     //ToDo: Please for one use Database Help Util Class, BUT make a check IF it exists in DB BUT it is the SAME just Ignore it then
+                     //  Besides that Everything works as intended 100%, Good job on this Sexy Revision
+ 
+@@ -272,6 +333,10 @@ public class XLegacyCore {
+                                 builtIn.size(),
+                                 parsedFromDatabase,
+                                 skipped));
++                  } catch (Throwable ex) {
++                      lastHookLoadDiagnostics = "EXCEPTION: " + ex + " | " + RuntimeUtils.getStackTraceSafeString(ex);
++                      logE(TAG, "Hook Load Diagnostics (exception): " + lastHookLoadDiagnostics);
++                  }
+                 });
+             }
+         }
+@@ -431,20 +496,20 @@ public class XLegacyCore {
+     public static void logE(String msg) { logE(msg, true); }
+     public static void logW(String msg) { logW(msg, true); }
+ 
+-    public static void logD(String msg, boolean xp) { if(xp) XposedBridge.log(tag_the_tag(TAG, "D" ) +  msg); Log.d(TAG, msg); }
+-    public static void logI(String msg, boolean xp) { if(xp) XposedBridge.log(tag_the_tag(TAG, "I") + msg); Log.i(TAG, msg); }
+-    public static void logE(String msg, boolean xp) { if(xp) XposedBridge.log(tag_the_tag(TAG, "E") + msg); Log.e(TAG, msg); }
+-    public static void logW(String msg, boolean xp) { if(xp) XposedBridge.log(tag_the_tag(TAG, "W") + msg); Log.w(TAG, msg); }
++    public static void logD(String msg, boolean xp) { if(xp) eu.faircode.xlua.SafeXposed.log(tag_the_tag(TAG, "D" ) +  msg); Log.d(TAG, msg); }
++    public static void logI(String msg, boolean xp) { if(xp) eu.faircode.xlua.SafeXposed.log(tag_the_tag(TAG, "I") + msg); Log.i(TAG, msg); }
++    public static void logE(String msg, boolean xp) { if(xp) eu.faircode.xlua.SafeXposed.log(tag_the_tag(TAG, "E") + msg); Log.e(TAG, msg); }
++    public static void logW(String msg, boolean xp) { if(xp) eu.faircode.xlua.SafeXposed.log(tag_the_tag(TAG, "W") + msg); Log.w(TAG, msg); }
+ 
+     public static void logD(String tag, String msg) { logD(tag, msg, true); }
+     public static void logI(String tag, String msg) { logI(tag, msg, true); }
+     public static void logE(String tag, String msg) { logE(tag, msg, true); }
+     public static void logW(String tag, String msg) { logW(tag, msg, true); }
+ 
+-    public static void logD(String tag, String msg, boolean xp) { if(xp) XposedBridge.log(tag_the_tag(tag, "D" ) +  msg); Log.d(TAG, msg); }
+-    public static void logI(String tag, String msg, boolean xp) { if(xp) XposedBridge.log(tag_the_tag(tag, "I") + msg); Log.i(TAG, msg); }
+-    public static void logE(String tag, String msg, boolean xp) { if(xp) XposedBridge.log(tag_the_tag(tag, "E") + msg); Log.e(TAG, msg); }
+-    public static void logW(String tag, String msg, boolean xp) { if(xp) XposedBridge.log(tag_the_tag(tag, "W") + msg); Log.w(TAG, msg); }
++    public static void logD(String tag, String msg, boolean xp) { if(xp) eu.faircode.xlua.SafeXposed.log(tag_the_tag(tag, "D" ) +  msg); Log.d(TAG, msg); }
++    public static void logI(String tag, String msg, boolean xp) { if(xp) eu.faircode.xlua.SafeXposed.log(tag_the_tag(tag, "I") + msg); Log.i(TAG, msg); }
++    public static void logE(String tag, String msg, boolean xp) { if(xp) eu.faircode.xlua.SafeXposed.log(tag_the_tag(tag, "E") + msg); Log.e(TAG, msg); }
++    public static void logW(String tag, String msg, boolean xp) { if(xp) eu.faircode.xlua.SafeXposed.log(tag_the_tag(tag, "W") + msg); Log.w(TAG, msg); }
+ 
+     @SuppressLint("WrongConstant")
+     public static void writeHookFromCache(
+diff --git a/app/src/main/java/eu/faircode/xlua/api/XProxyContent.java b/app/src/main/java/eu/faircode/xlua/api/XProxyContent.java
+index 1f8e55f..bce75f8 100644
+--- a/app/src/main/java/eu/faircode/xlua/api/XProxyContent.java
++++ b/app/src/main/java/eu/faircode/xlua/api/XProxyContent.java
+@@ -2,16 +2,13 @@ package eu.faircode.xlua.api;
+ 
+ import android.content.Context;
+ import android.database.Cursor;
+-import android.net.Uri;
+ import android.os.Bundle;
+-import android.provider.Settings;
+ import android.util.Log;
+ 
+-import eu.faircode.xlua.XSecurity;
+ import eu.faircode.xlua.api.xstandard.database.SqlQuerySnake;
+-import eu.faircode.xlua.logger.XLog;
+ import eu.faircode.xlua.x.Str;
+ import eu.faircode.xlua.x.xlua.LibUtil;
++import eu.faircode.xlua.x.xlua.commands.GlobalCommandBridge;
+ import eu.faircode.xlua.x.xlua.database.sql.SQLSnake;
+ 
+ public class XProxyContent {
+@@ -50,10 +47,33 @@ public class XProxyContent {
+     public static Cursor invokeQuery(Context context,String handler, String method) { return invokeQuery(context, handler, method, null, null); }
+     public static Cursor invokeQuery(Context context,String handler, String method, String[] args_selection) { return invokeQuery(context, handler, method, args_selection, null); }
+     public static Cursor invokeQuery(Context context,String handler, String method, String[] args_selection, String selection) {
++        // IMPORTANT (rootless/no Xposed): this used to go through
++        // context.getContentResolver().query(XSecurity.getURI(), ...), which requires a real,
++        // running ContentProvider to answer - either the "eu.faircode.xlua" authority hijacked via a
++        // system_server Xposed hook (real root+Xposed only, doesn't exist here), or the VXP provider
++        // which lives in a separate ":vxp" process that has to be spawned and initialized before it
++        // can answer, and can silently fail/never spawn under some LSPatch setups with zero visible
++        // error on our side.
++        //
++        // We are always calling this from our OWN process talking to our OWN data - there is no
++        // reason to round-trip through Binder/ContentResolver/another process at all for that. Call
++        // the exact same command-handling logic GlobalCommandBridge.vxpQuery uses, directly, in this
++        // process, on this thread. This is what VXP.java itself already delegates to; we're just
++        // skipping the unnecessary provider hop for our own app's UI.
++        try {
++            Cursor result = GlobalCommandBridge.vxpQuery(context, method, args_selection, handler);
++            if (result != null)
++                return result;
++        } catch (Throwable e) {
++            Log.e(TAG, "Direct in-process query failed! handler=" + handler + " method=" + method + " e=" + e + "\n" + Log.getStackTraceString(e));
++        }
++
++        // Fall back to the real ContentProvider (covers any legacy-only command not migrated to
++        // GlobalCommandBridge, and the genuine cross-app/cross-process use case).
+         try {
+             return context.getContentResolver()
+                     .query(
+-                            XSecurity.getURI(),
++                            eu.faircode.xlua.XSecurity.getURI(),
+                             new String[]{ handler + "." + method },
+                             selection,
+                             args_selection,
+@@ -66,9 +86,18 @@ public class XProxyContent {
+ 
+     public static Bundle invokeCall(Context context, String handler, String method) { return invokeCall(context,handler, method, new Bundle()); }
+     public static Bundle invokeCall(Context context, String handler, String method, Bundle extras) {
++        // See invokeQuery() above for why we call GlobalCommandBridge directly first.
++        try {
++            Bundle result = GlobalCommandBridge.vxpCall(context, method, extras, handler);
++            if (result != null)
++                return result;
++        } catch (Throwable e) {
++            Log.e(TAG, "Direct in-process call failed! handler=" + handler + " method=" + method + " e=" + e + "\n" + Log.getStackTraceString(e));
++        }
++
+         try {
+             return context.getContentResolver()
+-                    .call(XSecurity.getURI(), handler, method, extras);
++                    .call(eu.faircode.xlua.XSecurity.getURI(), handler, method, extras);
+         }catch (Exception e) {
+             Log.e(TAG, "Failed to Invoke Call! handler=" + handler + " method=" + method + " e=" + e + "\n" + Log.getStackTraceString(e));
+             return null;
+diff --git a/app/src/main/java/eu/faircode/xlua/api/xlua/provider/XLuaHookProvider.java b/app/src/main/java/eu/faircode/xlua/api/xlua/provider/XLuaHookProvider.java
+index d434e4f..1329a9c 100644
+--- a/app/src/main/java/eu/faircode/xlua/api/xlua/provider/XLuaHookProvider.java
++++ b/app/src/main/java/eu/faircode/xlua/api/xlua/provider/XLuaHookProvider.java
+@@ -87,7 +87,7 @@ public class XLuaHookProvider {
+             return (b != null && pi.versionCode == b.getInt("version"));
+         } catch (Throwable ex) {
+             Log.e(TAG, Log.getStackTraceString(ex));
+-            XposedBridge.log(ex);
++            eu.faircode.xlua.SafeXposed.log(ex);
+             return false;
+         }
+     }
+diff --git a/app/src/main/java/eu/faircode/xlua/api/xstandard/command/TryCallWrapper.java b/app/src/main/java/eu/faircode/xlua/api/xstandard/command/TryCallWrapper.java
+index ec58956..b61c641 100644
+--- a/app/src/main/java/eu/faircode/xlua/api/xstandard/command/TryCallWrapper.java
++++ b/app/src/main/java/eu/faircode/xlua/api/xstandard/command/TryCallWrapper.java
+@@ -34,7 +34,7 @@ public class TryCallWrapper implements Callable<Bundle> {
+         }catch (Throwable e) {
+             exception = e;
+             Log.e(TAG, "Call Error: packet=" + packet + " handler=" + handle.getName() + " \n" + e + "\n" + Log.getStackTraceString(e));
+-            XposedBridge.log("Call Error");
++            eu.faircode.xlua.SafeXposed.log("Call Error");
+             return null;
+         }finally {
+             policy.revert();
+diff --git a/app/src/main/java/eu/faircode/xlua/api/xstandard/command/TryQueryWrapper.java b/app/src/main/java/eu/faircode/xlua/api/xstandard/command/TryQueryWrapper.java
+index 0325427..49ad852 100644
+--- a/app/src/main/java/eu/faircode/xlua/api/xstandard/command/TryQueryWrapper.java
++++ b/app/src/main/java/eu/faircode/xlua/api/xstandard/command/TryQueryWrapper.java
+@@ -41,7 +41,7 @@ public class TryQueryWrapper implements Callable<Cursor> {
+         }catch (Throwable e) {
+             exception = e;
+             Log.e(TAG, "Query Error: packet=" + packet + " command=" + handle.getName() + " \n" + e + "\n" + Log.getStackTraceString(e));
+-            XposedBridge.log("Query Error");
++            eu.faircode.xlua.SafeXposed.log("Query Error");
+             return null;
+         }finally {
+             policy.revert();
+diff --git a/app/src/main/java/eu/faircode/xlua/hooks/XReporter.java b/app/src/main/java/eu/faircode/xlua/hooks/XReporter.java
+index 25b7ffa..c568e53 100644
+--- a/app/src/main/java/eu/faircode/xlua/hooks/XReporter.java
++++ b/app/src/main/java/eu/faircode/xlua/hooks/XReporter.java
+@@ -194,7 +194,7 @@ public class XReporter {
+                                         .call(XSecurity.getURI(), "xlua", "report", args);
+                             } catch (Throwable ex) {
+                                 Log.e(TAG, Log.getStackTraceString(ex));
+-                                XposedBridge.log(ex);
++                                eu.faircode.xlua.SafeXposed.log(ex);
+                             }
+                     }
+                 }, 1000);
+diff --git a/app/src/main/java/eu/faircode/xlua/logger/XLog.java b/app/src/main/java/eu/faircode/xlua/logger/XLog.java
+index 6b4d845..7f90d5e 100644
+--- a/app/src/main/java/eu/faircode/xlua/logger/XLog.java
++++ b/app/src/main/java/eu/faircode/xlua/logger/XLog.java
+@@ -76,7 +76,7 @@ public class XLog {
+         if(ENFORCE_CAT_LOG) {
+             XBasicLog log = XBasicLog.create(tag, msg, e, className, methodName, dumpStack, getLastCall);
+             Log.e(log.tag, log.message);
+-            if(xposedLog) XposedBridge.log(log.toString());
++            if(xposedLog) eu.faircode.xlua.SafeXposed.log(log.toString());
+         }
+     }
+ 
+@@ -101,7 +101,7 @@ public class XLog {
+         if(ENFORCE_CAT_LOG) {
+             XBasicLog log = XBasicLog.create(tag, msg, null, className, methodName, dumpStack, getLastCall);
+             Log.i(log.tag, log.message);
+-            if(xposedLog) XposedBridge.log(log.toString());
++            if(xposedLog) eu.faircode.xlua.SafeXposed.log(log.toString());
+         }
+     }
+ 
+@@ -126,7 +126,7 @@ public class XLog {
+         if(ENFORCE_CAT_LOG) {
+             XBasicLog log = XBasicLog.create(tag, msg, null, className, methodName, dumpStack, getLastCall);
+             Log.w(log.tag, log.message);
+-            if(xposedLog) XposedBridge.log(log.toString());
++            if(xposedLog) eu.faircode.xlua.SafeXposed.log(log.toString());
+         }
+     }
+ }
+diff --git a/app/src/main/java/eu/faircode/xlua/utilities/DatabasePathUtil.java b/app/src/main/java/eu/faircode/xlua/utilities/DatabasePathUtil.java
+index bfbc656..71fc0be 100644
+--- a/app/src/main/java/eu/faircode/xlua/utilities/DatabasePathUtil.java
++++ b/app/src/main/java/eu/faircode/xlua/utilities/DatabasePathUtil.java
+@@ -19,7 +19,7 @@ public class DatabasePathUtil {
+     //make a function to ensure not alot of copies ? find what has all the files
+ 
+     public static void log(String data, boolean error) {
+-        XposedBridge.log(data);
++        eu.faircode.xlua.SafeXposed.log(data);
+         if(error)
+             Log.e(TAG, data);
+         else
+@@ -78,31 +78,31 @@ public class DatabasePathUtil {
+             return true;
+ 
+         Log.i(TAG, "ensureDirectoryChange");
+-        XposedBridge.log("ensureDirectoryChange");
++        eu.faircode.xlua.SafeXposed.log("ensureDirectoryChange");
+         String originalDirectory = getOriginalDataLocationString(null);
+         File oDir = new File(originalDirectory);
+         Log.i(TAG, "Ensuring Directory does not exist: " + originalDirectory);
+-        XposedBridge.log("Ensuring Directory does not exist: " + originalDirectory);
++        eu.faircode.xlua.SafeXposed.log("Ensuring Directory does not exist: " + originalDirectory);
+ 
+         File nDir = getDatabaseDirectory(context);
+         if (nDir == null) {
+             String newDir = getDefaultLocationString(null) + "-" + UUID.randomUUID().toString();
+             Log.i(TAG, "New Directory! =" + newDir);
+             nDir = new File(newDir);
+-            XposedBridge.log("New Directory: " + nDir.getAbsolutePath());
++            eu.faircode.xlua.SafeXposed.log("New Directory: " + nDir.getAbsolutePath());
+             XFileUtils.mkdirs(nDir);
+         }
+ 
+         if(oDir.exists() && oDir.isDirectory()) {
+             if (!XFileUtils.copyDirectories(oDir, nDir, true, Process.SYSTEM_UID)) {
+                 Log.e(TAG, "Failed to Copy over the Database Files to the new Directory! new dir=" + nDir.getAbsolutePath());
+-                XposedBridge.log("Failed to Copy over the Database Files to the new Directory! new dir=" + nDir.getAbsolutePath());
++                eu.faircode.xlua.SafeXposed.log("Failed to Copy over the Database Files to the new Directory! new dir=" + nDir.getAbsolutePath());
+                 XFileUtils.forceDelete(nDir, true, Process.SYSTEM_UID);
+                 return false;
+             }
+ 
+             if(!XFileUtils.forceDelete(oDir, true, Process.SYSTEM_UID)) {
+-                XposedBridge.log("Failed to Delete Old Directory=" + oDir.getAbsolutePath());
++                eu.faircode.xlua.SafeXposed.log("Failed to Delete Old Directory=" + oDir.getAbsolutePath());
+                 Log.e(TAG, "Failed to Delete Old Directory=" + oDir.getAbsolutePath());
+             }
+         }
+diff --git a/app/src/main/java/eu/faircode/xlua/x/ui/adapters/hooks/elements/XHookJsonUtils.java b/app/src/main/java/eu/faircode/xlua/x/ui/adapters/hooks/elements/XHookJsonUtils.java
+index 6196b02..c779953 100644
+--- a/app/src/main/java/eu/faircode/xlua/x/ui/adapters/hooks/elements/XHookJsonUtils.java
++++ b/app/src/main/java/eu/faircode/xlua/x/ui/adapters/hooks/elements/XHookJsonUtils.java
+@@ -1,13 +1,17 @@
+ package eu.faircode.xlua.x.ui.adapters.hooks.elements;
+ 
+ import android.content.Context;
++import android.content.res.AssetManager;
+ 
+ import org.json.JSONArray;
+ 
++import java.io.IOException;
+ import java.io.InputStream;
+ import java.util.ArrayList;
+ import java.util.Enumeration;
++import java.util.HashMap;
+ import java.util.List;
++import java.util.Map;
+ import java.util.Scanner;
+ import java.util.zip.ZipEntry;
+ import java.util.zip.ZipFile;
+@@ -26,9 +30,155 @@ public class XHookJsonUtils {
+     private static final String TAG = LibUtil.generateTag(XHookJsonUtils.class);
+     public static final String JSON_NAME_HOOK = "hooks.json";
+ 
++    // PERFORMANCE FIX: getLuaScript(apk, scriptName) used to open a brand new ZipFile and do a full
++    // linear scan of EVERY entry in the apk, for EVERY SINGLE hook that references a lua script by
++    // name (the "@scriptname" convention). With ~800 built-in hooks that's ~800 full re-reads of the
++    // whole apk's central directory + entry scan - confirmed in logcat to take 15+ seconds by itself.
++    // Fix: build a one-time map of (lowercase basename -> lua source) for a given apk path, and reuse
++    // it for the whole batch of hooks being parsed in one readHooks()/readHooksFromAssets() call.
++    // Keyed by apk path so a stale cache from a previous (different) apk path is never reused.
++    private static volatile String luaScriptCacheApkKey = null;
++    private static volatile Map<String, String> luaScriptCache = null;
++
++    private static synchronized Map<String, String> getOrBuildLuaScriptCache(String apk) {
++        if (apk != null && apk.equals(luaScriptCacheApkKey) && luaScriptCache != null)
++            return luaScriptCache;
++
++        Map<String, String> cache = new HashMap<>();
++        ZipFile zipFile = null;
++        long start = System.currentTimeMillis();
++        try {
++            zipFile = new ZipFile(apk);
++            Enumeration<? extends ZipEntry> entries = zipFile.entries();
++            while (entries.hasMoreElements()) {
++                ZipEntry entry = entries.nextElement();
++                String name = entry.getName();
++                if (Str.isEmpty(name))
++                    continue;
++
++                String lower = name.toLowerCase();
++                if (!lower.endsWith(".lua") || lower.contains("__deprecated"))
++                    continue;
++
++                // Basename only - script names are looked up by "@scriptname" (no path), and are
++                // expected to be unique across the whole asset tree. First one found wins, same as
++                // the original entries.hasMoreElements() scan order behavior.
++                int slash = lower.lastIndexOf('/');
++                String baseName = slash >= 0 ? lower.substring(slash + 1) : lower;
++                if (cache.containsKey(baseName))
++                    continue;
++
++                InputStream inputStream = null;
++                try {
++                    inputStream = zipFile.getInputStream(entry);
++                    cache.put(baseName, new Scanner(inputStream).useDelimiter("\\A").next());
++                } catch (Exception ignored) {
++                } finally {
++                    StreamUtil.close(inputStream);
++                }
++            }
++        } catch (Exception e) {
++            XLegacyCore.logE(TAG, Str.fm("Error building lua script cache from apk (%s)! Error=%s", apk, e));
++        } finally {
++            StreamUtil.close(zipFile);
++        }
++
++        XLegacyCore.logI(TAG, Str.fm("Built lua script cache: %s entries from apk (%s) in %sms",
++                cache.size(), apk, System.currentTimeMillis() - start));
++
++        luaScriptCacheApkKey = apk;
++        luaScriptCache = cache;
++        return cache;
++    }
++
+     public static boolean isAsset(String name, String endCompare) { return name.startsWith("assets/") && name.endsWith(endCompare); }
+ 
++    // Fallback path used when reading assets/hooks.json (+ every nested */hooks.json) directly out of
++    // the on-disk apk file (readHooks() below) comes back empty. This happens in rootless/LSPatch
++    // builds where either the apk path we resolved doesn't have the layout we expect, or - unlike a
++    // real Xposed hook running inside some *other* app's process - this code now legitimately runs
++    // inside our OWN process (see VXP.java), so context.getAssets() is guaranteed to point at the
++    // right assets and is actually the more robust way to read them.
++    public static List<XHook> readHooksFromAssets(Context context) {
++        List<XHook> result = new ArrayList<>();
++        if(context == null)
++            return result;
+ 
++        try {
++            List<String> allPaths = new ArrayList<>();
++            collectAssetPaths(context.getAssets(), "", allPaths);
++
++            for(String path : allPaths) {
++                if(!path.endsWith(JSON_NAME_HOOK))
++                    continue;
++
++                try(InputStream is = context.getAssets().open(path)) {
++                    String jsonData = new Scanner(is).useDelimiter("\\A").next();
++                    if(Str.length(jsonData) < 5)
++                        continue;
++
++                    JSONArray jsonArray = new JSONArray(jsonData);
++                    int length = ArrayUtils.safeLength(jsonArray);
++                    for(int i = 0; i < length; i++) {
++                        try {
++                            XHook hook = XHook.create(jsonArray.getJSONObject(i)).setIsBuiltIn(true);
++                            hook.luaScript = resolveAssetLuaScript(context, allPaths, hook.luaScript);
++                            hook.resolveClass(context);
++                            result.add(hook);
++                        }catch (Exception e) {
++                            XLegacyCore.logE(TAG, Str.fm("Error Parsing Json Element at (%s) From Asset [%s] Error=%s", i, path, e));
++                        }
++                    }
++                }catch (Exception e) {
++                    XLegacyCore.logE(TAG, Str.fm("Error Reading Asset Hooks Json [%s] Error=%s", path, e));
++                }
++            }
++
++            if(DebugUtil.isDebug())
++                XLegacyCore.logD(TAG, Str.fm("Finished Reading (%s) Hooks from context.getAssets() Fallback! Scanned Asset Path Count=%s", result.size(), allPaths.size()));
++        }catch (Exception e) {
++            XLegacyCore.logE(TAG, Str.fm("Error Listing/Reading context.getAssets() for Hooks Fallback! Error=%s Stack=%s", e, RuntimeUtils.getStackTraceSafeString(e)));
++        }
++
++        return result;
++    }
++
++    private static void collectAssetPaths(AssetManager am, String dir, List<String> out) {
++        try {
++            String[] list = am.list(dir);
++            if(list == null || list.length == 0)
++                return;
++
++            for(String name : list) {
++                String full = dir.isEmpty() ? name : dir + "/" + name;
++                String[] sub = am.list(full);
++                if(sub != null && sub.length > 0)
++                    collectAssetPaths(am, full, out);
++                else
++                    out.add(full);
++            }
++        }catch (IOException ignored) { }
++    }
++
++    private static String resolveAssetLuaScript(Context context, List<String> allPaths, String scriptName) {
++        if(Str.isEmpty(scriptName))
++            return XHook.DEFAULT_SCRIPT;
++
++        String trimmed = Str.trimOriginal(scriptName);
++        if(!trimmed.startsWith("@") || trimmed.length() < 4)
++            return scriptName;
++
++        String targetScript = Str.ensureEndsWith(trimmed.substring(1), ".lua").toLowerCase();
++        for(String path : allPaths) {
++            if(path.toLowerCase().endsWith(targetScript)) {
++                try(InputStream is = context.getAssets().open(path)) {
++                    return new Scanner(is).useDelimiter("\\A").next();
++                }catch (Exception ignored) { }
++            }
++        }
++
++        return scriptName;
++    }
+ 
+     public static List<XHook> readHooks(Context context, String apk) {
+         long startTime = System.currentTimeMillis();
+@@ -188,42 +338,18 @@ public class XHookJsonUtils {
+         if(!trimmed.startsWith("@") || trimmed.length() < 4)
+             return scriptName;
+ 
+-        String targetScript = Str.ensureEndsWith(trimmed.substring(1), ".lua");
+-        ZipFile zipFile = null;
+-        try {
+-            zipFile = new ZipFile(apk);
+-            Enumeration<? extends ZipEntry> entries = zipFile.entries();
+-            if(DebugUtil.isDebug())
+-                XLegacyCore.logI(TAG, Str.fm("Starting Lua Script Search for Script [%s][%s] from Apk [%s]",
+-                        scriptName,
+-                        targetScript,
+-                        apk));
+-
+-            while (entries.hasMoreElements()) {
+-                InputStream inputStream = null;
+-                try {
+-                    ZipEntry entry = entries.nextElement();
+-                    String name = entry.getName();
+-                    if(Str.isEmpty(name))
+-                        continue;
+-
+-                    if(!name.toLowerCase().endsWith(targetScript) || name.toLowerCase().contains("__deprecated"))
+-                        continue;
++        String targetScript = Str.ensureEndsWith(trimmed.substring(1), ".lua").toLowerCase();
+ 
+-                    inputStream = zipFile.getInputStream(entry);
+-                    return new Scanner(inputStream).useDelimiter("\\A").next(); //Check if its empty ? if so keep going ?
+-                }catch (Exception ignored) {
+-                } finally {
+-                    StreamUtil.close(inputStream);
+-                }
+-            }
+-        }catch (Exception e) {
+-            XLegacyCore.logE(TAG, Str.fm("Error Finding [%s] Lua Script From (%s) Apk! Error=%e",
++        try {
++            Map<String, String> cache = getOrBuildLuaScriptCache(apk);
++            String content = cache.get(targetScript);
++            if(content != null)
++                return content;
++        } catch (Exception e) {
++            XLegacyCore.logE(TAG, Str.fm("Error Finding [%s] Lua Script From (%s) Apk (cached)! Error=%s",
+                     scriptName,
+                     apk,
+                     e));
+-        } finally {
+-            StreamUtil.close(zipFile);
+         }
+ 
+         return null;
+diff --git a/app/src/main/java/eu/faircode/xlua/x/xlua/XposedUtility.java b/app/src/main/java/eu/faircode/xlua/x/xlua/XposedUtility.java
+index 171ed96..d9a499a 100644
+--- a/app/src/main/java/eu/faircode/xlua/x/xlua/XposedUtility.java
++++ b/app/src/main/java/eu/faircode/xlua/x/xlua/XposedUtility.java
+@@ -27,24 +27,24 @@ public class XposedUtility {
+     public static void logD_xposed(String tag, String msg) {
+         Log.d(tag, msg);
+         if(isUnderXposed())
+-            XposedBridge.log("[" + tag + "] " + msg);
++            eu.faircode.xlua.SafeXposed.log("[" + tag + "] " + msg);
+     }
+ 
+     public static void logE_xposed(String tag, String msg) {
+         Log.e(tag, msg);
+         if(isUnderXposed())
+-            XposedBridge.log("[" + tag + "] " + msg);
++            eu.faircode.xlua.SafeXposed.log("[" + tag + "] " + msg);
+     }
+ 
+     public static void logI_xposed(String tag, String msg) {
+         Log.i(tag, msg);
+         if(isUnderXposed())
+-            XposedBridge.log("[" + tag + "] " + msg);
++            eu.faircode.xlua.SafeXposed.log("[" + tag + "] " + msg);
+     }
+ 
+     public static void logW_xposed(String tag, String msg) {
+         Log.w(tag, msg);
+         if(isUnderXposed())
+-            XposedBridge.log("[" + tag + "] " + msg);
++            eu.faircode.xlua.SafeXposed.log("[" + tag + "] " + msg);
+     }
+ }
+diff --git a/app/src/main/java/eu/faircode/xlua/x/xlua/commands/call/GetSettingExCommand.java b/app/src/main/java/eu/faircode/xlua/x/xlua/commands/call/GetSettingExCommand.java
+index d166403..e54cd3e 100644
+--- a/app/src/main/java/eu/faircode/xlua/x/xlua/commands/call/GetSettingExCommand.java
++++ b/app/src/main/java/eu/faircode/xlua/x/xlua/commands/call/GetSettingExCommand.java
+@@ -36,7 +36,16 @@ public class GetSettingExCommand extends CallCommandHandlerEx {
+     public static final String SETTING_VERBOSE_DEBUG = "verbose_debug_logs";
+     public static final String SETTING_SELECTED_CONFIG = "selected_config";
+ 
+-    public static final String SETTING_COLLECTION_DEFAULT = "PrivacyEx";
++    // BUG: this was just "PrivacyEx". The base built-in hooks in assets/hooks.json (and its
++    // sub-folders) are tagged "collection":"Privacy" (see e.g. assets/hooks.json), while only a
++    // smaller subset use "PrivacyEx". The legacy/old system's equivalent default was
++    // "Privacy,PrivacyEx" (see LuaSettingsManager.DEFAULT_COLLECTIONS) - somewhere during the
++    // migration to this new settings system the "Privacy," part got dropped from the default.
++    // Effect: on every fresh install/db, XHook.isAvailable(...) rejects almost every built-in hook
++    // because its "collection" isn't in the (wrongly short) default enabled-collections list, so
++    // the Collections dialog looks empty of *effect* and hooks never show as "applied" to any app
++    // in the expanded app row, even though the hooks themselves loaded fine.
++    public static final String SETTING_COLLECTION_DEFAULT = "Privacy,PrivacyEx";
+     public static final String SETTING_THEME_DEFAULT = "dark";
+ 
+ 
+diff --git a/app/src/main/java/eu/faircode/xlua/x/xlua/database/wrappers/GlobalDatabaseResolver.java b/app/src/main/java/eu/faircode/xlua/x/xlua/database/wrappers/GlobalDatabaseResolver.java
+index f13b23a..e3367ff 100644
+--- a/app/src/main/java/eu/faircode/xlua/x/xlua/database/wrappers/GlobalDatabaseResolver.java
++++ b/app/src/main/java/eu/faircode/xlua/x/xlua/database/wrappers/GlobalDatabaseResolver.java
+@@ -562,21 +562,21 @@ public class GlobalDatabaseResolver {
+ 
+     public static void logI(String msg) {
+         Log.i(TAG, msg);
+-        XposedBridge.log(TAG + " " + msg);
++        eu.faircode.xlua.SafeXposed.log(TAG + " " + msg);
+     }
+ 
+     public static void logD(String msg) {
+         Log.d(TAG, msg);
+-        XposedBridge.log(TAG + " " + msg);
++        eu.faircode.xlua.SafeXposed.log(TAG + " " + msg);
+     }
+ 
+     public static void logE(String msg) {
+         Log.e(TAG, msg);
+-        XposedBridge.log(TAG + " " + msg);
++        eu.faircode.xlua.SafeXposed.log(TAG + " " + msg);
+     }
+ 
+     public static void logW(String msg) {
+         Log.w(TAG, msg);
+-        XposedBridge.log(TAG + " " + msg);
++        eu.faircode.xlua.SafeXposed.log(TAG + " " + msg);
+     }
+ }
+diff --git a/app/src/main/java/eu/faircode/xlua/x/xlua/database/wrappers/XDatabaseMapper.java b/app/src/main/java/eu/faircode/xlua/x/xlua/database/wrappers/XDatabaseMapper.java
+index fceeb9a..1b1daf2 100644
+--- a/app/src/main/java/eu/faircode/xlua/x/xlua/database/wrappers/XDatabaseMapper.java
++++ b/app/src/main/java/eu/faircode/xlua/x/xlua/database/wrappers/XDatabaseMapper.java
+@@ -151,21 +151,21 @@ public class XDatabaseMapper {
+ 
+     public static void logI(String msg) {
+         Log.i(TAG, msg);
+-        XposedBridge.log(TAG + " " + msg);
++        eu.faircode.xlua.SafeXposed.log(TAG + " " + msg);
+     }
+ 
+     public static void logD(String msg) {
+         Log.d(TAG, msg);
+-        XposedBridge.log(TAG + " " + msg);
++        eu.faircode.xlua.SafeXposed.log(TAG + " " + msg);
+     }
+ 
+     public static void logE(String msg) {
+         Log.e(TAG, msg);
+-        XposedBridge.log(TAG + " " + msg);
++        eu.faircode.xlua.SafeXposed.log(TAG + " " + msg);
+     }
+ 
+     public static void logW(String msg) {
+         Log.w(TAG, msg);
+-        XposedBridge.log(TAG + " " + msg);
++        eu.faircode.xlua.SafeXposed.log(TAG + " " + msg);
+     }
+ }
+diff --git a/app/src/main/java/eu/faircode/xlua/x/xlua/database/wrappers/XLuaDatabaseHelp.java b/app/src/main/java/eu/faircode/xlua/x/xlua/database/wrappers/XLuaDatabaseHelp.java
+index 43e2329..efbabe2 100644
+--- a/app/src/main/java/eu/faircode/xlua/x/xlua/database/wrappers/XLuaDatabaseHelp.java
++++ b/app/src/main/java/eu/faircode/xlua/x/xlua/database/wrappers/XLuaDatabaseHelp.java
+@@ -163,7 +163,7 @@ public class XLuaDatabaseHelp {
+ 
+         }catch (Throwable e) {
+             Log.e(TAG, Str.fm("Error with X-LUA Init Database old, Error:%s", e));
+-            XposedBridge.log(Str.fm("Error with X-LUA Init Database old, Error:%s", e));
++            eu.faircode.xlua.SafeXposed.log(Str.fm("Error with X-LUA Init Database old, Error:%s", e));
+         } finally {
+             database.writeUnlock();
+         }
+@@ -176,7 +176,7 @@ public class XLuaDatabaseHelp {
+             long rows = _db.update("assignment", cv, "hook = ?", new String[]{oldId});
+         } catch (Throwable ex) {
+             Log.e(TAG, Str.fm("Error Renaming Hook ID, Old:%s  New%s  Error:%s", oldId, newId, ex));
+-            XposedBridge.log(Str.fm("Error Renaming Hook ID, Old:%s  New%s  Error:%s", oldId, newId, ex));
++            eu.faircode.xlua.SafeXposed.log(Str.fm("Error Renaming Hook ID, Old:%s  New%s  Error:%s", oldId, newId, ex));
+         }
+     }
+ }
+diff --git a/app/src/main/java/eu/faircode/xlua/x/xlua/database/wrappers/XLuaDatabaseManager.java b/app/src/main/java/eu/faircode/xlua/x/xlua/database/wrappers/XLuaDatabaseManager.java
+index 4eaf532..64db153 100644
+--- a/app/src/main/java/eu/faircode/xlua/x/xlua/database/wrappers/XLuaDatabaseManager.java
++++ b/app/src/main/java/eu/faircode/xlua/x/xlua/database/wrappers/XLuaDatabaseManager.java
+@@ -45,7 +45,7 @@ public class XLuaDatabaseManager implements IDatabaseManager {
+         try {
+             if(db == null) {
+                 db = new SQLDatabase(SQLDatabase.DATABASE_X_LUA, context, true);
+-                XposedBridge.log(Str.fm("Opened Database, Database=%s", Str.noNL(db)));
++                eu.faircode.xlua.SafeXposed.log(Str.fm("Opened Database, Database=%s", Str.noNL(db)));
+                 reset(false);
+                 if(!db.isOpen(true))
+                     return false;
+@@ -59,6 +59,12 @@ public class XLuaDatabaseManager implements IDatabaseManager {
+                 DatabaseUpdater.ensureUpdated(context, db);
+                 //GlobalDatabaseResolver.initEnsureFunctions(context, db);
+                 //DatabaseUpdater<SettingReMappedItem.Setting_legacy>
++            } else if(db != null && db.isOpen(true)) {
++                // "init" only guards the one-shot DB schema upgrade above. initializeFromJsons() can
++                // fail silently (see XLegacyCore.ensureHooksLoaded doc) - this makes sure that if the
++                // in-memory hooks cache ended up empty, we keep retrying on every subsequent DB access
++                // instead of being stuck with an empty Hooks list for the rest of the process lifetime.
++                XLegacyCore.ensureHooksLoaded(context, db);
+             }
+         }catch (Throwable e) {
+             Log.e(TAG, Str.fm("Error Init for XLua Database! Database=%s  Error=%s", db, e));
+@@ -70,7 +76,7 @@ public class XLuaDatabaseManager implements IDatabaseManager {
+ 
+     @Override
+     public void reset(boolean setDatabaseNull) {
+-        XposedBridge.log("Resetting Database (xl), Set Database to null: " + String.valueOf(setDatabaseNull));
++        eu.faircode.xlua.SafeXposed.log("Resetting Database (xl), Set Database to null: " + String.valueOf(setDatabaseNull));
+         if(setDatabaseNull && db != null) {
+             if(db.isOpen())
+                 db.close();
+diff --git a/app/src/main/java/eu/faircode/xlua/x/xlua/database/wrappers/XMocDatabaseManager.java b/app/src/main/java/eu/faircode/xlua/x/xlua/database/wrappers/XMocDatabaseManager.java
+index 3408a6c..a9e4e5c 100644
+--- a/app/src/main/java/eu/faircode/xlua/x/xlua/database/wrappers/XMocDatabaseManager.java
++++ b/app/src/main/java/eu/faircode/xlua/x/xlua/database/wrappers/XMocDatabaseManager.java
+@@ -33,7 +33,7 @@ public class XMocDatabaseManager implements IDatabaseManager  {
+ 
+             if(db == null) {
+                 db = new SQLDatabase(SQLDatabase.DATABASE_MOCK, context, true);
+-                XposedBridge.log(Str.fm("Opened Database [2], Database=%s", Str.noNL(db)));
++                eu.faircode.xlua.SafeXposed.log(Str.fm("Opened Database [2], Database=%s", Str.noNL(db)));
+                 reset(false);
+                 if(!db.isOpen(true))
+                     return false;
+@@ -50,7 +50,7 @@ public class XMocDatabaseManager implements IDatabaseManager  {
+ 
+     @Override
+     public void reset(boolean setDatabaseNull) {
+-        XposedBridge.log("Resetting Database (xm), Set Database to null: " + String.valueOf(setDatabaseNull));
++        eu.faircode.xlua.SafeXposed.log("Resetting Database (xm), Set Database to null: " + String.valueOf(setDatabaseNull));
+         if(setDatabaseNull && db != null) {
+             if(db.isOpen())
+                 db.close();
+diff --git a/app/src/main/java/eu/faircode/xlua/VXP.java b/app/src/main/java/eu/faircode/xlua/VXP.java
+index 831bcee..e0de67b 100644
+--- a/app/src/main/java/eu/faircode/xlua/VXP.java
++++ b/app/src/main/java/eu/faircode/xlua/VXP.java
+@@ -55,13 +55,15 @@ public class VXP extends ContentProvider {
+         }
+         catch (Throwable ex) {
+             Log.e(TAG, Log.getStackTraceString(ex));
+-            XposedBridge.log(ex);
++            eu.faircode.xlua.SafeXposed.log(ex);
+             return null;
+         }
+     }
+ 
+     @Override
+     public boolean onCreate() {
++        Log.i(TAG, "VXP ContentProvider onCreate() - process=" + android.os.Process.myPid() +
++                " packageName=" + (getContext() == null ? "null-ctx" : getContext().getPackageName()));
+         return true;
+     }
+ 
+@@ -78,14 +80,20 @@ public class VXP extends ContentProvider {
+             String arg = split[1];
+ 
+             Cursor result = GlobalCommandBridge.vxpQuery(getContext(), arg, selectionArgs, method);
+-            if (result == null)
++            String source = "new";
++            if (result == null) {
+                 result = XCommandBridgeStatic.vxpQuery(getContext(), arg, selectionArgs, method);
++                source = "old";
++            }
++
++            Log.i(TAG, "Query " + arg + " result source=" + source +
++                    " rows=" + (result == null ? "NULL_CURSOR" : String.valueOf(result.getCount())));
+ 
+             return result;
+             //return XProvider.query(getContext(), projection[0].split("\\.")[1], selectionArgs);
+         } catch (Throwable ex) {
+             Log.e(TAG, Log.getStackTraceString(ex));
+-            XposedBridge.log(ex);
++            eu.faircode.xlua.SafeXposed.log(ex);
+             return null;
+         }
+     }

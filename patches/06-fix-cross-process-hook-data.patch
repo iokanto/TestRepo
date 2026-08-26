@@ -1,0 +1,92 @@
+diff --git a/app/src/main/java/eu/faircode/xlua/api/XProxyContent.java b/app/src/main/java/eu/faircode/xlua/api/XProxyContent.java
+index bce75f8..5ca97d8 100644
+--- a/app/src/main/java/eu/faircode/xlua/api/XProxyContent.java
++++ b/app/src/main/java/eu/faircode/xlua/api/XProxyContent.java
+@@ -44,32 +44,44 @@ public class XProxyContent {
+     public static Cursor invokeQuery(Context context, String handler, String method, SQLSnake query) { return invokeQuery(context, handler, method, query.getWhereArgs(), query.getWhereClause()); }
+ 
+ 
++    // CRITICAL: the in-process GlobalCommandBridge bypass below is only valid when this code is
++    // running INSIDE XPL-EX'S OWN PROCESS, talking to its own data. The exact same class
++    // (XProxyContent, via GetAssignedHooksExCommand etc.) is also executed by HookCore/XLua.java
++    // INSIDE EVERY TARGET APP that gets patched with LSPatch and has XPL-EX embedded as a module -
++    // there, "context" is the TARGET app's own Application context (e.g. "device info"), not XPL-EX's.
++    // GlobalCommandBridge/XLuaDatabaseManager are static, PER-PROCESS singletons that resolve their
++    // database path via context.getExternalFilesDir(...) - calling vxpQuery/vxpCall directly with a
++    // target app's context reads/writes to THAT APP'S OWN, always-empty sandboxed database, never
++    // XPL-EX's real one. This was silently making every hook assignment invisible to every hooked
++    // target app - the actual interception logic in HookCore.initHooks() would always see zero
++    // assigned hooks, regardless of what was really saved.
++    //
++    // Real cross-app IPC (ContentResolver -> the VXP ContentProvider, which always executes inside
++    // XPL-EX's own process regardless of who calls it) is REQUIRED whenever the caller isn't XPL-EX
++    // itself. Only take the fast direct-call shortcut for our own package.
++    private static boolean isSelfPackage(Context context) {
++        try {
++            return context != null && eu.faircode.xlua.BuildConfig.APPLICATION_ID.equals(context.getPackageName());
++        } catch (Throwable e) {
++            return false;
++        }
++    }
++
+     public static Cursor invokeQuery(Context context,String handler, String method) { return invokeQuery(context, handler, method, null, null); }
+     public static Cursor invokeQuery(Context context,String handler, String method, String[] args_selection) { return invokeQuery(context, handler, method, args_selection, null); }
+     public static Cursor invokeQuery(Context context,String handler, String method, String[] args_selection, String selection) {
+-        // IMPORTANT (rootless/no Xposed): this used to go through
+-        // context.getContentResolver().query(XSecurity.getURI(), ...), which requires a real,
+-        // running ContentProvider to answer - either the "eu.faircode.xlua" authority hijacked via a
+-        // system_server Xposed hook (real root+Xposed only, doesn't exist here), or the VXP provider
+-        // which lives in a separate ":vxp" process that has to be spawned and initialized before it
+-        // can answer, and can silently fail/never spawn under some LSPatch setups with zero visible
+-        // error on our side.
+-        //
+-        // We are always calling this from our OWN process talking to our OWN data - there is no
+-        // reason to round-trip through Binder/ContentResolver/another process at all for that. Call
+-        // the exact same command-handling logic GlobalCommandBridge.vxpQuery uses, directly, in this
+-        // process, on this thread. This is what VXP.java itself already delegates to; we're just
+-        // skipping the unnecessary provider hop for our own app's UI.
+-        try {
+-            Cursor result = GlobalCommandBridge.vxpQuery(context, method, args_selection, handler);
+-            if (result != null)
+-                return result;
+-        } catch (Throwable e) {
+-            Log.e(TAG, "Direct in-process query failed! handler=" + handler + " method=" + method + " e=" + e + "\n" + Log.getStackTraceString(e));
++        if (isSelfPackage(context)) {
++            try {
++                Cursor result = GlobalCommandBridge.vxpQuery(context, method, args_selection, handler);
++                if (result != null)
++                    return result;
++            } catch (Throwable e) {
++                Log.e(TAG, "Direct in-process query failed! handler=" + handler + " method=" + method + " e=" + e + "\n" + Log.getStackTraceString(e));
++            }
+         }
+ 
+-        // Fall back to the real ContentProvider (covers any legacy-only command not migrated to
+-        // GlobalCommandBridge, and the genuine cross-app/cross-process use case).
++        // Real cross-process ContentResolver call. Always used when this is a target app's hooked
++        // process calling in (not XPL-EX itself), and as a fallback otherwise.
+         try {
+             return context.getContentResolver()
+                     .query(
+@@ -86,13 +98,14 @@ public class XProxyContent {
+ 
+     public static Bundle invokeCall(Context context, String handler, String method) { return invokeCall(context,handler, method, new Bundle()); }
+     public static Bundle invokeCall(Context context, String handler, String method, Bundle extras) {
+-        // See invokeQuery() above for why we call GlobalCommandBridge directly first.
+-        try {
+-            Bundle result = GlobalCommandBridge.vxpCall(context, method, extras, handler);
+-            if (result != null)
+-                return result;
+-        } catch (Throwable e) {
+-            Log.e(TAG, "Direct in-process call failed! handler=" + handler + " method=" + method + " e=" + e + "\n" + Log.getStackTraceString(e));
++        if (isSelfPackage(context)) {
++            try {
++                Bundle result = GlobalCommandBridge.vxpCall(context, method, extras, handler);
++                if (result != null)
++                    return result;
++            } catch (Throwable e) {
++                Log.e(TAG, "Direct in-process call failed! handler=" + handler + " method=" + method + " e=" + e + "\n" + Log.getStackTraceString(e));
++            }
+         }
+ 
+         try {

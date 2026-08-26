@@ -1,0 +1,65 @@
+diff --git a/app/src/main/java/eu/faircode/xlua/VXP.java b/app/src/main/java/eu/faircode/xlua/VXP.java
+index b97bde9..831bcee 100644
+--- a/app/src/main/java/eu/faircode/xlua/VXP.java
++++ b/app/src/main/java/eu/faircode/xlua/VXP.java
+@@ -30,6 +30,7 @@ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
+ 
+ import de.robv.android.xposed.XposedBridge;
++import eu.faircode.xlua.x.xlua.commands.GlobalCommandBridge;
+ 
+ public class VXP extends ContentProvider {
+     private static final String TAG = "XLua.VXP";
+@@ -42,8 +43,15 @@ public class VXP extends ContentProvider {
+                     " uid=" + android.os.Process.myUid() +
+                     " cuid=" + android.os.Binder.getCallingUid());
+ 
+-            return XCommandBridgeStatic.vxpCall(getContext(), arg, extras, method);
+-            //return XProvider.call(getContext(), arg, extras);
++            // The current UI (FragmentMain / HooksExActivity / PutHookExCommand / AssignHooksCommand etc.)
++            // talks to the *new* GlobalCommandBridge command set, not the legacy XCommandBridgeStatic one.
++            // Try the new bridge first, and only fall back to the legacy bridge for commands that were
++            // never migrated (e.g. old "getVersion"/"putHook"/"clearApp" style calls).
++            Bundle result = GlobalCommandBridge.vxpCall(getContext(), arg, extras, method);
++            if (result == null)
++                result = XCommandBridgeStatic.vxpCall(getContext(), arg, extras, method);
++
++            return result;
+         }
+         catch (Throwable ex) {
+             Log.e(TAG, Log.getStackTraceString(ex));
+@@ -69,7 +77,11 @@ public class VXP extends ContentProvider {
+             String method = split[0];
+             String arg = split[1];
+ 
+-            return XCommandBridgeStatic.vxpQuery(getContext(), arg, selectionArgs, method);
++            Cursor result = GlobalCommandBridge.vxpQuery(getContext(), arg, selectionArgs, method);
++            if (result == null)
++                result = XCommandBridgeStatic.vxpQuery(getContext(), arg, selectionArgs, method);
++
++            return result;
+             //return XProvider.query(getContext(), projection[0].split("\\.")[1], selectionArgs);
+         } catch (Throwable ex) {
+             Log.e(TAG, Log.getStackTraceString(ex));
+diff --git a/app/src/main/java/eu/faircode/xlua/XSecurity.java b/app/src/main/java/eu/faircode/xlua/XSecurity.java
+index ad5256a..537530b 100644
+--- a/app/src/main/java/eu/faircode/xlua/XSecurity.java
++++ b/app/src/main/java/eu/faircode/xlua/XSecurity.java
+@@ -46,7 +46,16 @@ public class XSecurity {
+     }
+ 
+ 
+-    public static Uri getURI() { return XposedUtil.isVirtualXposed() ? Uri.parse("content://eu.faircode.xlua.vxp/") : Settings.System.CONTENT_URI; }
++    // "content://eu.faircode.xlua/" is NOT a real, declared authority - it only "works" on a rooted
++    // device where Xposed hooks the ContentProvider dispatch inside system_server and answers on
++    // behalf of Settings.System.CONTENT_URI. In a rootless/LSPatch build there is no such hook, so
++    // both that fake authority and Settings.System.CONTENT_URI resolve to nothing / the real settings
++    // provider and every query/call silently returns null (hence the empty Hooks list).
++    //
++    // The ONLY authority that is actually declared in the manifest and backed by a real ContentProvider
++    // running inside our own process is "eu.faircode.xlua.vxp" (see VXP.java). That is what must be used
++    // here for rootless operation.
++    public static Uri getURI() { return Uri.parse("content://eu.faircode.xlua.vxp/"); }
+     public static String getProFingerPrint(Context context) {
+         try {
+             return XUtil.getSha1FingerprintString(context, XCommandBridgeStatic.PRO_PACKAGE);

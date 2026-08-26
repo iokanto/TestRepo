@@ -1,0 +1,107 @@
+diff --git a/app/src/main/java/eu/faircode/xlua/XLegacyCore.java b/app/src/main/java/eu/faircode/xlua/XLegacyCore.java
+index c0145f3..bdc7a73 100644
+--- a/app/src/main/java/eu/faircode/xlua/XLegacyCore.java
++++ b/app/src/main/java/eu/faircode/xlua/XLegacyCore.java
+@@ -228,8 +228,23 @@ public class XLegacyCore {
+                                 if(!hook.isValid()) {
+                                     logE(TAG, "Bad Hook=" + hook.methodName);
+                                 } else {
++                                    boolean isBad = false;
++
++                                    // BUG FIX: this whole block used to be wrapped in
++                                    // "if(!Str.isEmpty(hook.luaScript) && hook.luaScript.contains(\"param:\"))",
++                                    // which meant EVERY hook read back from the database whose lua script
++                                    // does not literally contain the substring "param:" got silently
++                                    // skipped entirely - never added to hooks/databaseDefs, no log, nothing.
++                                    // Manually created/edited hooks show up immediately after creation only
++                                    // because PutHookExCommand adds them straight to the in-memory cache at
++                                    // that moment; on the NEXT app start, only JSON-sourced built-in hooks and
++                                    // "param:"-using database hooks got reloaded here - any hook without that
++                                    // exact substring in its script vanished from the list (while still being
++                                    // genuinely present in the "hook" table, which is why export - which reads
++                                    // the table directly - still showed them). The "param:" placeholder
++                                    // validation below is only relevant to hooks that actually use it; it must
++                                    // not gate whether the hook gets cached at all.
+                                     if(!Str.isEmpty(hook.luaScript) && hook.luaScript.contains("param:")) {
+-                                        boolean isBad = false;
+                                         if(hook.isDefaultScript()) {
+                                             XHook other = builtIn.get(hook.getObjectId());
+                                             if(other != null && !other.isDefaultScript()) {
+@@ -284,38 +299,38 @@ public class XLegacyCore {
+                                                 }
+                                             }
+                                         }
++                                    }
+ 
+-                                        //Final Check...
+-                                        if(!isBad) {
+-                                            XHook other = builtIn.get(hook.getObjectId());
+-                                            boolean isSafe = false;
+-                                            if(other != null) {
+-                                                int versionOriginal = other.version == null ? 0 : Math.max(0, other.version);
+-                                                int versionNew = hook.version == null ? 0 : Math.max(0, hook.version);
+-                                                if(versionNew > versionOriginal)
+-                                                    isSafe = true;
+-                                                else if(versionNew == versionOriginal) {
+-                                                    String jsonOne = XHookIO.toJsonString(other, 0);
+-                                                    String jsonTwo = XHookIO.toJsonString(hook, 0);
+-                                                    if(!Str.areEqual(jsonOne, jsonTwo, false))
+-                                                        isSafe = true;
+-                                                }
+-                                            } else {
++                                    //Final Check... (now runs for EVERY valid hook, not just "param:" ones)
++                                    if(!isBad) {
++                                        XHook other = builtIn.get(hook.getObjectId());
++                                        boolean isSafe = false;
++                                        if(other != null) {
++                                            int versionOriginal = other.version == null ? 0 : Math.max(0, other.version);
++                                            int versionNew = hook.version == null ? 0 : Math.max(0, hook.version);
++                                            if(versionNew > versionOriginal)
+                                                 isSafe = true;
++                                            else if(versionNew == versionOriginal) {
++                                                String jsonOne = XHookIO.toJsonString(other, 0);
++                                                String jsonTwo = XHookIO.toJsonString(hook, 0);
++                                                if(!Str.areEqual(jsonOne, jsonTwo, false))
++                                                    isSafe = true;
+                                             }
++                                        } else {
++                                            isSafe = true;
++                                        }
+ 
+-                                            if(isSafe) {
+-                                                hook.builtin = false;
+-                                                hooks.put(hook.getObjectId(), hook);
+-                                                databaseDefs.put(hook.getObjectId(), hook);
+-                                                parsedFromDatabase++;
+-                                            } else {
+-                                                skipped++;
+-                                                if(DebugUtil.isDebug())
+-                                                    logE(Str.fm("Hook [%s] Failed the Final Test... Other=[%s]",
+-                                                            hook.getObjectId(),
+-                                                            Str.toObjectId(other)));
+-                                            }
++                                        if(isSafe) {
++                                            hook.builtin = false;
++                                            hooks.put(hook.getObjectId(), hook);
++                                            databaseDefs.put(hook.getObjectId(), hook);
++                                            parsedFromDatabase++;
++                                        } else {
++                                            skipped++;
++                                            if(DebugUtil.isDebug())
++                                                logE(Str.fm("Hook [%s] Failed the Final Test... Other=[%s]",
++                                                        hook.getObjectId(),
++                                                        Str.toObjectId(other)));
+                                         }
+                                     }
+                                 }
+@@ -328,6 +343,10 @@ public class XLegacyCore {
+                         CursorUtil.closeCursor(cursor);
+                     }
+ 
++                    if (DebugUtil.isDebug())
++                        logI(TAG, Str.fm("Database-sourced hooks loaded: parsedFromDatabase=%s skipped=%s totalCachedHooks=%s",
++                                parsedFromDatabase, skipped, hooks.size()), false);
++
+                     if(DebugUtil.isDebug())
+                         logD(Str.fm("Total Cached Hooks Count=%s Built In Cached Count=%s Parsed From Database Count=%s Skipped=%s",
+                                 hooks.size(),

@@ -1,0 +1,288 @@
+diff --git a/app/src/main/java/eu/faircode/xlua/ActivityMain.java b/app/src/main/java/eu/faircode/xlua/ActivityMain.java
+index 1d71735b..06dab36b 100644
+--- a/app/src/main/java/eu/faircode/xlua/ActivityMain.java
++++ b/app/src/main/java/eu/faircode/xlua/ActivityMain.java
+@@ -74,6 +74,7 @@ import eu.faircode.xlua.utilities.PrefUtil;
+ import eu.faircode.xlua.x.Str;
+ import eu.faircode.xlua.x.data.PrefManager;
+ import eu.faircode.xlua.x.data.utils.ListUtil;
++import eu.faircode.xlua.x.file.FileEx;
+ import eu.faircode.xlua.x.ui.FileDialogUtils;
+ import eu.faircode.xlua.x.ui.activities.HooksExActivity;
+ import eu.faircode.xlua.x.ui.activities.SettingsExActivity;
+@@ -124,7 +125,7 @@ public class ActivityMain extends ActivityBase {
+     @Override
+     protected void onCreate(Bundle savedInstanceState) {
+         super.onCreate(savedInstanceState);
+-
++/*
+         manager.ensureIsOpen(this, PrefManager.SETTINGS_MAIN);
+         // Check if service is running
+         if (!XLuaHookProvider.isAvailable(this)) {
+@@ -140,7 +141,7 @@ public class ActivityMain extends ActivityBase {
+ 
+         if(!invokeNeedsRebootCheck() || !invokeDatabaseCheck())
+             return;
+-
++*/
+         // Set layout
+         setContentView(R.layout.main);
+ 
+diff --git a/app/src/main/java/eu/faircode/xlua/FragmentMain.java b/app/src/main/java/eu/faircode/xlua/FragmentMain.java
+index fe2b6576..61194307 100644
+--- a/app/src/main/java/eu/faircode/xlua/FragmentMain.java
++++ b/app/src/main/java/eu/faircode/xlua/FragmentMain.java
+@@ -38,6 +38,9 @@ import android.widget.Button;
+ import android.widget.ProgressBar;
+ import android.widget.Spinner;
+ import android.widget.TextView;
++import android.content.pm.ApplicationInfo;
++import android.content.pm.PackageInfo;
++import android.content.pm.PackageManager;
+ 
+ import com.google.android.material.snackbar.Snackbar;
+ 
+@@ -378,10 +381,53 @@ public class FragmentMain extends Fragment implements ILoader {
+ 
+                 data.hooks.addAll(hooksCopy);
+ 
+-                // Load apps
+-                List<AppXpPacket> appsCopy = GetAppsCommand.get(getContext(), true);
++                // Load apps (ROOTLESS FALLBACK)
++                List<AppXpPacket> appsCopy = new ArrayList<>();
++                try {
++                    // Try the standard path through the ContentProvider first
++                    appsCopy = GetAppsCommand.get(getContext(), true);
++                } catch (Exception e) {
++                    if (DebugUtil.isDebug())
++                        Log.w(TAG, "GetAppsCommand failed, falling back to PackageManager. Error=" + e, e);
++                }
++
++                // If the provider returned nothing or threw, fall back to a direct system query
++                if (appsCopy == null || appsCopy.isEmpty()) {
++                    if (DebugUtil.isDebug())
++                        Log.i(TAG, "Using direct PackageManager fallback for app list");
++                    appsCopy = getLocalAppsDirectly(getContext()); // Now it's like method static
++
++                    // BUG FIX: this fallback used to build AppXpPacket objects straight from
++                    // PackageManager with NO assignment data at all (app.assignments stayed the
++                    // default empty list). Whenever GetAppsCommand.get() returned empty/threw for
++                    // ANY reason (which, being wrapped in a broad try/catch above, can happen
++                    // silently and intermittently), every checkbox for every hook on every app would
++                    // render as unchecked - regardless of what was actually saved in the database.
++                    // That's exactly the "checkbox resets after refresh/reopen" symptom: the app list
++                    // itself looks identical either way (same real installed apps from
++                    // PackageManager), so there was no visible sign *which* path had been taken -
++                    // only the (missing) checkmarks gave it away.
++                    //
++                    // Load real assignment data for this fallback list too, so a fallback vs. a
++                    // successful GetAppsCommand.get() is no longer visibly different to the user.
++                    try {
++                        java.util.Map<String, AppXpPacket> byPkg = new java.util.HashMap<>();
++                        for (AppXpPacket a : appsCopy)
++                            byPkg.put(a.packageName, a);
++
++                        eu.faircode.xlua.x.xlua.database.sql.SQLDatabase db =
++                                eu.faircode.xlua.x.xlua.commands.GlobalCommandBridge.luaCommandService.databaseManager.getDatabase(getContext());
++
++                        eu.faircode.xlua.x.xlua.hook.AppProviderUtils.initAppsAssignmentSettings(
++                                byPkg, db, eu.faircode.xlua.x.xlua.identity.UserIdentityUtils.getUserId(android.os.Process.myUid()));
++                    } catch (Throwable e) {
++                        if (DebugUtil.isDebug())
++                            Log.e(TAG, "Failed to attach assignments to PackageManager fallback app list! " + e);
++                    }
++                }
++
+                 if(DebugUtil.isDebug())
+-                    Log.d(TAG, "Apps Loaded=" + ListUtil.size(appsCopy));
++                    Log.d(TAG, "Apps Loaded (Fallback)=" + ListUtil.size(appsCopy));
+ 
+                 data.apps.addAll(appsCopy);
+             } catch (Throwable ex) {
+@@ -413,6 +459,34 @@ public class FragmentMain extends Fragment implements ILoader {
+         }
+     };
+ 
++    private static List<AppXpPacket> getLocalAppsDirectly(Context context) {
++        List<AppXpPacket> localApps = new ArrayList<>();
++        PackageManager pm = context.getPackageManager();
++        String selfPackage = context.getPackageName(); // XPL-EX's own package name
++
++        List<PackageInfo> packages = pm.getInstalledPackages(PackageManager.GET_META_DATA);
++
++        for (PackageInfo pi : packages) {
++            if (pi.applicationInfo == null) continue;
++
++            if (pi.packageName.equals(selfPackage)) {
++                continue;
++            }
++
++            AppXpPacket app = new AppXpPacket();
++            app.packageName = pi.packageName;
++            app.label = pi.applicationInfo.loadLabel(pm).toString();
++            app.uid = pi.applicationInfo.uid;
++            app.system = (pi.applicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0;
++            app.enabled = pi.applicationInfo.enabled;
++            app.icon = pi.applicationInfo.icon;
++
++            localApps.add(app);
++        }
++
++        return localApps;
++    }
++
+     private static class DataHolder {
+         AdapterApp.enumShow show;
+         String theme;
+diff --git a/app/src/main/java/eu/faircode/xlua/x/xlua/database/DatabasePathUtil.java b/app/src/main/java/eu/faircode/xlua/x/xlua/database/DatabasePathUtil.java
+index f65cec78..db624067 100644
+--- a/app/src/main/java/eu/faircode/xlua/x/xlua/database/DatabasePathUtil.java
++++ b/app/src/main/java/eu/faircode/xlua/x/xlua/database/DatabasePathUtil.java
+@@ -44,79 +44,43 @@ public class DatabasePathUtil {
+     public static final String X_NAME = "xlua.db";
+ 
+     public static final UnixAccessControl DEFAULT_ACCESS = UnixAccessBuilder.create()
+-            .setOwnerUid(Process.SYSTEM_UID)
+-            .setGroupUid(Process.SYSTEM_UID)
++            .setOwnerUid(Process.myUid())
++            .setGroupUid(Process.myUid())
+             .setOwnerMode(ModePermission.READ_WRITE_EXECUTE)
+             .setGroupMode(ModePermission.READ_WRITE_EXECUTE)
+             .setOtherMode(ModePermission.NONE)
+             .build();
+ 
+     public static void deleteAndroidDirectories() {
+-        internalTryDelete("data");
+-        internalTryDelete("obb");
++        // internalTryDelete("data");
++        // internalTryDelete("obb");
+     }
+ 
+     public static FileEx getDatabaseDirectory(Context context) {
+-        if (context != null && XposedUtil.isVirtualXposed())
+-            return new FileEx(context.getFilesDir());
+-
+-        FileEx newBaseDirectory = FileEx.createFromDirectory(NEW_DIRECTORY);
+-        List<FileEx> newFolders = FileUtils.sortFromLastModified(findXplDatabaseFolders(newBaseDirectory,
+-                true,
+-                true,
+-                NEW_PREFIX,
+-                true,
+-                DEFAULT_ACCESS));
+-
+-        if(ListUtil.isValid(newFolders)) {
+-            FileEx first = ListUtil.getFirst(newFolders);
+-            logD(Str.fm("Found Database Folder! Using Folder [%s] as XPL-EX base Folder for Databases!", first.getAbsolutePath()));
+-            return first;
+-        }
+-
+-        List<FileEx> oldFolders = FileUtils.combineTwoLists(
+-                findXplDatabaseFolders(FileEx.createFromDirectory(OLD_DIRECTORY), true, true, NEW_PREFIX, true, DEFAULT_ACCESS),
+-                findXplDatabaseFolders(FileEx.createFromDirectory(OLD_DIRECTORY), true, true, OLD_PREFIX, false, DEFAULT_ACCESS),
+-                true);
++        if (context != null) {
++            // 1. Try use external storage (Rootless-safe):
++            // /storage/emulated/0/Android/data/<package_name>/files/xplex_db
++            File externalDir = context.getExternalFilesDir("xplex_db");
++            if (externalDir != null) {
++                if (!externalDir.exists()) {
++                    externalDir.mkdirs();
++                }
++                logD(Str.fm("Using Rootless-Safe Database Directory: %s", externalDir.getAbsolutePath()));
++                return new FileEx(externalDir);
++            }
+ 
+-        if(DebugUtil.isDebug())
+-            XposedUtility.logW_xposed(TAG, Str.fm("Missing XPL-EX Database Folder! Parent Directory=[%s] Found in old Directory [%] Count=%s",
+-                    NEW_DIRECTORY,
+-                    OLD_DIRECTORY,
+-                    ListUtil.size(oldFolders)));
+-
+-        if(!ListUtil.isValid(oldFolders)) {
+-            FileEx newDirectory = newBaseDirectory.openSub(Str.combine(NEW_PREFIX, UUID.randomUUID().toString()));
+-            newDirectory.mkdirs();
+-            newDirectory.takeFullControl(DEFAULT_ACCESS, true);
+-            if(DebugUtil.isDebug())
+-                XposedUtility.logD_xposed(TAG, Str.fm("Failed to Find XPL-EX Database Folder in [%s] and in [%s] now creating and using Folder [%s] Created=%s",
+-                        NEW_DIRECTORY,
+-                        OLD_DIRECTORY,
+-                        newDirectory.getAbsolutePath(),
+-                        String.valueOf(newDirectory.isDirectory())));
+-
+-            return newDirectory;
+-        } else {
+-            FileEx firstDirectory = ListUtil.getFirst(oldFolders);
+-            //We can also just force it a new name ?
+-            //We can also create it here should we ?
+-            FileEx newDirectory = firstDirectory.getName().equalsIgnoreCase(OLD_PREFIX) ?
+-                    newBaseDirectory.openSub(Str.combine(NEW_PREFIX, UUID.randomUUID().toString())) :
+-                    newBaseDirectory.openSub(firstDirectory.getName());
+-
+-            newDirectory.mkdirs();
+-            int copied = FileTransfer.copyDirectory(firstDirectory, newDirectory, true, DEFAULT_ACCESS);
+-            if(DebugUtil.isDebug())
+-                XposedUtility.logD_xposed(TAG, Str.fm("Failed to Find XPL-EX Database Folder in [%s] copying from the old Folder [%s] to [%s] Copied Count=%s Is Directory=%s",
+-                        NEW_DIRECTORY,
+-                        firstDirectory.getAbsolutePath(),
+-                        newDirectory.getAbsolutePath(),
+-                        String.valueOf(copied),
+-                        String.valueOf(newDirectory.isDirectory())));
+-
+-            return newDirectory;
++            // 2. Fallback: if external storage unaccesable, use internal:
++            // /data/data/<package_name>/files/xplex_db
++            File internalDir = new File(context.getFilesDir(), "xplex_db");
++            if (!internalDir.exists()) {
++                internalDir.mkdirs();
++            }
++            logD(Str.fm("Using Internal Fallback Database Directory: %s", internalDir.getAbsolutePath()));
++            return new FileEx(internalDir);
+         }
++
++        logE("Context is null! Cannot determine database directory.");
++        return null;
+     }
+ 
+     public static List<FileEx> findXplDatabaseFolders(
+@@ -200,6 +164,7 @@ public class DatabasePathUtil {
+ 
+     //ToDo: Asap move this crap code
+     private static void internalTryDelete(String scope) {
++/*
+         List<String> paths = Arrays.asList(
+                 Environment.getExternalStorageDirectory().getAbsolutePath() + "/Android/" + scope + "/eu.faircode.xlua",
+                 "/storage/emulated/0/\\342\\200\\213Android/" + scope + "/eu.faircode.xlua",
+@@ -210,9 +175,11 @@ public class DatabasePathUtil {
+             makeDirectoryDeletable(p);
+             forceDeleteDirectory(p);
+         }
++*/
+     }
+ 
+     public static boolean makeDirectoryDeletable(String targetPath) {
++/*
+         try {
+             String currentUid = String.valueOf(Process.myUid());
+             String[] chownCommand = {"chown", "-R", currentUid + ":" + currentUid, targetPath};
+@@ -233,10 +200,13 @@ public class DatabasePathUtil {
+         } catch (Exception e) {
+             return false;
+         }
++*/
++        return false;
+     }
+ 
+ 
+     public static boolean forceDeleteDirectory(String targetPath) {
++/*
+         try {
+             // Create the process
+             String[] command = {"rm", "-rf", targetPath};
+@@ -251,5 +221,7 @@ public class DatabasePathUtil {
+         } catch (Exception e) {
+             return false;
+         }
++*/
++        return false;
+     }
+ }
