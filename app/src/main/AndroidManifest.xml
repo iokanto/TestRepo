@@ -1,0 +1,175 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    package="eu.faircode.xlua">
+
+    <!-- https://developer.android.com/preview/privacy/package-visibility -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
+    <application
+        android:requestLegacyExternalStorage="false"
+
+        android:name="ApplicationEx"
+        android:allowBackup="false"
+        android:appCategory="productivity"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:largeHeap="true"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/AppThemeLight">
+
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="@string/app_name" />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="82" />
+        <meta-data
+            android:name="xposedscope"
+            android:resource="@array/scopes" />
+
+        <activity
+            android:name=".ActivityMain"
+            android:exported="true"
+            android:configChanges="orientation|screenSize"
+            android:launchMode="singleTask"
+            android:resizeableActivity="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".ActivityHelp"
+            android:exported="true"
+            android:configChanges="orientation|screenSize"
+            android:label="@string/menu_help"
+            android:launchMode="singleTop"
+            android:parentActivityName=".ActivityMain"
+            android:resizeableActivity="true">
+            <meta-data
+                android:name="android.support.PARENT_ACTIVITY"
+                android:value=".ActivityMain" />
+        </activity>
+
+        <activity
+            android:name=".x.ui.activities.HooksExActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize"
+            android:label="@string/menu_hooks"
+            android:launchMode="singleTop"
+            android:parentActivityName=".ActivityMain"
+            android:resizeableActivity="true">
+            <meta-data android:name="android.support.PARENT_ACTIVITY" android:value=".ActivityMain" />
+        </activity>
+
+        <activity
+            android:name=".ActivityProperties"
+            android:exported="true"
+            android:configChanges="orientation|screenSize"
+            android:label="@string/menu_props"
+            android:launchMode="singleTop"
+            android:parentActivityName=".ActivityMain"
+            android:resizeableActivity="true">
+            <meta-data
+                android:name="android.support.PARENT_ACTIVITY"
+                android:value=".ActivityMain" />
+        </activity>
+
+        <activity
+            android:name=".ActivityAppControl"
+            android:exported="true"
+            android:configChanges="orientation|screenSize"
+            android:label="@string/menu_hooks"
+            android:launchMode="singleTop"
+            android:parentActivityName=".ActivityMain"
+            android:resizeableActivity="true">
+            <meta-data
+                android:name="android.support.PARENT_ACTIVITY"
+                android:value=".ActivityMain" />
+        </activity>
+
+
+        <activity
+            android:name=".ActivitySettings"
+            android:exported="true"
+            android:configChanges="orientation|screenSize"
+            android:label="@string/menu_settings"
+            android:launchMode="singleTop"
+            android:parentActivityName=".ActivityMain"
+            android:resizeableActivity="true">
+            <meta-data
+                android:name="android.support.PARENT_ACTIVITY"
+                android:value=".ActivityMain" />
+        </activity>
+
+        <activity
+            android:name=".x.ui.activities.SettingsExActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize"
+            android:label="@string/menu_settings"
+            android:launchMode="singleTop"
+            android:parentActivityName=".ActivityMain"
+            android:resizeableActivity="true">
+            <meta-data
+                android:name="android.support.PARENT_ACTIVITY"
+                android:value=".ActivityMain" />
+        </activity>
+
+        <activity
+            android:name=".ActivityConfig"
+            android:exported="true"
+            android:configChanges="orientation|screenSize"
+            android:label="@string/menu_configs"
+            android:launchMode="singleTop"
+            android:parentActivityName=".ActivityMain"
+            android:resizeableActivity="true">
+            <meta-data
+                android:name="android.support.PARENT_ACTIVITY"
+                android:value=".ActivityMain" />
+        </activity>
+
+        <activity
+            android:name=".ActivityDatabase"
+            android:exported="true"
+            android:configChanges="orientation|screenSize"
+            android:label="@string/app_name"
+            android:launchMode="singleTop"
+            android:parentActivityName=".ActivityMain"
+            android:resizeableActivity="true">
+            <meta-data
+                android:name="android.support.PARENT_ACTIVITY"
+                android:value=".ActivityMain" />
+        </activity>
+
+
+
+        <activity
+            android:name=".ActivityCpu"
+            android:exported="true"
+            android:configChanges="orientation|screenSize"
+            android:label="@string/app_name"
+            android:launchMode="singleTop"
+            android:parentActivityName=".ActivityMain"
+            android:resizeableActivity="true">
+            <meta-data
+                android:name="android.support.PARENT_ACTIVITY"
+                android:value=".ActivityMain" />
+        </activity>
+
+        <provider
+            android:name=".VXP"
+            android:exported="true"
+            android:authorities="eu.faircode.xlua.vxp"
+            android:process=":vxp" />
+    </application>
+</manifest>
