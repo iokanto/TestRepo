@@ -11,3 +11,11 @@
 /tools/config.sh
 /app/release
 keystore.properties
+examples
+repo
+app/src/main/assets/*
+!app/src/main/assets/*.json
+app/src/main/assets/_*
+!app/src/main/assets/analytics
+!app/src/main/assets/sensors
+
