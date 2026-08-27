@@ -1,0 +1,149 @@
+diff --git a/app/src/main/java/eu/faircode/xlua/x/xlua/hook/HooksSettingsGlobal.java b/app/src/main/java/eu/faircode/xlua/x/xlua/hook/HooksSettingsGlobal.java
+index 2ccc7c7..dcc44b0 100644
+--- a/app/src/main/java/eu/faircode/xlua/x/xlua/hook/HooksSettingsGlobal.java
++++ b/app/src/main/java/eu/faircode/xlua/x/xlua/hook/HooksSettingsGlobal.java
+@@ -45,6 +45,9 @@ public class HooksSettingsGlobal {
+     private static final Map<String, String> collections = new HashMap<>();
+     private static final Map<String, List<String>> settingsMap = new HashMap<>();
+     private static final Map<String, String> remappedSettings = new HashMap<>();
++    // settingName (lowercased) -> raw propNames (e.g. "device.brand" -> ["ro.product.brand", ...]).
++    // See PropMapEntry for why this exists.
++    private static final Map<String, List<String>> propNameMap = new HashMap<>();
+ 
+ 
+     public static List<XHook> getHooksEx(Context context) { return GetHooksCommand.getHooks(context, true, false); }
+@@ -149,6 +152,21 @@ public class HooksSettingsGlobal {
+                 if(!Str.isEmpty(setting)) {
+                     ListUtil.addAllIfValidEx(all, settingsMap.get(setting));
+ 
++                    // BUG FIX: hooks only ever list their own RAW property names (e.g.
++                    // "ro.product.brand") in XHook.settings - never the friendly, grouped setting
++                    // name shown in the UI (e.g. "device.brand", from settingdefaults.json). Without
++                    // this translation step, looking up a friendly name here always found nothing in
++                    // settingsMap (which is keyed by those raw names, built in init() above), which is
++                    // exactly why the "hook menu" button always showed getCount() == 0. propmaps.json
++                    // (PropMapEntry, loaded by internalInitPropMap below) provides the
++                    // friendly-name -> raw-property-names mapping needed to bridge the two.
++                    List<String> propNames = propNameMap.get(setting.toLowerCase());
++                    if(ListUtil.isValid(propNames)) {
++                        for(String propName : propNames)
++                            if(!Str.isEmpty(propName))
++                                ListUtil.addAllIfValidEx(all, settingsMap.get(propName));
++                    }
++
+                     /*if(setting.length() > 5) {
+                         char last = setting.charAt(setting.length() - 1);
+                         if(Character.isDigit(last)) {
+@@ -176,6 +194,7 @@ public class HooksSettingsGlobal {
+             collections.clear();
+             settingsMap.clear();
+             remappedSettings.clear();
++            propNameMap.clear();
+         }
+     }
+ 
+@@ -187,6 +206,7 @@ public class HooksSettingsGlobal {
+         synchronized (lock) {
+             if(settingsMap.isEmpty()) {
+                 internalInitReMappedSettings(context);
++                internalInitPropMap(context);
+                 List<XHook> hooks = GetHooksCommand.getHooks(context, true, true);
+                 if(DebugUtil.isDebug()) {
+                     Log.d(TAG, "Got Hooks Count=" + ListUtil.size(hooks));
+@@ -289,6 +309,23 @@ public class HooksSettingsGlobal {
+         }catch (Exception e) {
+             Log.e(TAG, "Failed to Init Settings Re Map, Error=" + e);
+         }
++
++    }
++
++    // BUG FIX: this method was called (from init(), above) but never actually defined anywhere in
++    // this file - a compile error. Loads propmaps.json (see PropMapEntry for the schema and why this
++    // mapping is needed) so getHookIdsForSettings() can translate a friendly setting name like
++    // "device.brand" into the raw property names ("ro.product.brand", ...) that hooks actually
++    // declare in their own "settings" list.
++    private static void internalInitPropMap(Context context) {
++        try {
++            for(PropMapEntry entry : JsonHelperEx.findJsonElementsFromAssets(XUtil.getApk(context), PropMapEntry.JSON, true, PropMapEntry.class)) {
++                if(entry != null && !Str.isEmpty(entry.settingName) && ListUtil.isValid(entry.propNames))
++                    propNameMap.put(entry.settingName.toLowerCase(), entry.propNames);
++            }
++        }catch (Exception e) {
++            Log.e(TAG, "Failed to Init Prop Map, Error=" + e);
++        }
+     }
+ 
+     private static void internalAdd(String settingName, String hookId) {
+diff --git a/app/src/main/java/eu/faircode/xlua/x/xlua/hook/PropMapEntry.java b/app/src/main/java/eu/faircode/xlua/x/xlua/hook/PropMapEntry.java
+new file mode 100644
+index 0000000..b7c7ce9
+--- /dev/null
++++ b/app/src/main/java/eu/faircode/xlua/x/xlua/hook/PropMapEntry.java
+@@ -0,0 +1,67 @@
++package eu.faircode.xlua.x.xlua.hook;
++
++import androidx.annotation.NonNull;
++
++import org.json.JSONArray;
++import org.json.JSONException;
++import org.json.JSONObject;
++
++import java.util.ArrayList;
++import java.util.List;
++
++import eu.faircode.xlua.x.Str;
++import eu.faircode.xlua.x.data.JsonHelperEx;
++import eu.faircode.xlua.x.data.string.StrBuilder;
++import eu.faircode.xlua.x.data.utils.ListUtil;
++import eu.faircode.xlua.x.xlua.interfaces.IJsonType;
++
++/**
++ * Maps a friendly/grouped "settingName" (e.g. "device.brand", the name shown in a SettingsContainer
++ * built from settingdefaults.json) to the actual, raw property names (e.g. "ro.product.brand",
++ * "ro.product.manufacturer") that individual hooks declare in their own "settings" list
++ * (assets/*hooks.json -> XHook.settings, consumed by HooksSettingsGlobal.init()).
++ * <p>
++ * Without this translation, HooksSettingsGlobal.getHookIdsForSettings(context, ["device.brand"])
++ * never finds anything: no hook lists "device.brand" itself in its "settings" array, only the raw
++ * property names it actually hooks. That mismatch is exactly why the "hook menu" button
++ * (ivBtHookMenu, ?attr/hookMenu) always found getCount() == 0 and showed the "---" placeholder /
++ * "no hooks" error instead of opening the assign-hooks dialog.
++ */
++public class PropMapEntry implements IJsonType {
++    public static final String JSON = "propmaps.json";
++
++    public static final String FIELD_SETTING_NAME = "settingName";
++    public static final String FIELD_PROP_NAMES = "propNames";
++
++    public String settingName;
++    public final List<String> propNames = new ArrayList<>();
++
++    @Override
++    public String toJSONString() throws JSONException { return toJSONObject().toString(); }
++
++    @Override
++    public JSONObject toJSONObject() throws JSONException {
++        JSONObject obj = new JSONObject();
++        obj.put(FIELD_SETTING_NAME, this.settingName);
++        obj.put(FIELD_PROP_NAMES, new JSONArray(this.propNames));
++        return obj;
++    }
++
++    @Override
++    public void fromJSONObject(JSONObject obj) throws JSONException {
++        if(obj != null) {
++            this.settingName = obj.optString(FIELD_SETTING_NAME);
++            ListUtil.addAll(this.propNames, JsonHelperEx.getStringArrayAsList(obj, FIELD_PROP_NAMES), true);
++        }
++    }
++
++    @NonNull
++    @Override
++    public String toString() {
++        return StrBuilder.create()
++                .appendFieldLine(FIELD_SETTING_NAME, this.settingName)
++                .appendDividerTitleLine(Str.combineEx(FIELD_PROP_NAMES, "[", this.propNames.size(), "]"))
++                .appendLine(this.propNames, Str.NEW_LINE)
++                .toString(true);
++    }
++}

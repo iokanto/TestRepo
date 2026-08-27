@@ -1,0 +1,59 @@
+diff --git a/app/src/main/java/eu/faircode/xlua/api/properties/MockPropConversions.java b/app/src/main/java/eu/faircode/xlua/api/properties/MockPropConversions.java
+index f041dd1..968ad8a 100644
+--- a/app/src/main/java/eu/faircode/xlua/api/properties/MockPropConversions.java
++++ b/app/src/main/java/eu/faircode/xlua/api/properties/MockPropConversions.java
+@@ -28,7 +28,8 @@ public class MockPropConversions {
+     }
+ 
+     public static Collection<MockPropGroupHolder> createHolders(Context context, Collection<MockPropSetting> properties, Collection<LuaSettingExtended> settings) {
+-        Log.i(TAG, " properties returned =" + properties.size());
++        if (DebugUtil.isDebug())
++            Log.i(TAG, " properties returned =" + properties.size());
+ 
+         HashMap<String, MockPropGroupHolder> groups = new HashMap<>();
+         for(MockPropSetting prop : properties) {
+@@ -58,7 +59,8 @@ public class MockPropConversions {
+             }
+         }
+ 
+-        Log.i(TAG, "groups = " + groups.size());
++        if (DebugUtil.isDebug())
++            Log.i(TAG, "groups = " + groups.size());
+         return groups.values();
+     }
+ 
+diff --git a/app/src/main/java/eu/faircode/xlua/api/properties/MockPropMap.java b/app/src/main/java/eu/faircode/xlua/api/properties/MockPropMap.java
+index e6e3f1a..3475ca2 100644
+--- a/app/src/main/java/eu/faircode/xlua/api/properties/MockPropMap.java
++++ b/app/src/main/java/eu/faircode/xlua/api/properties/MockPropMap.java
+@@ -161,7 +161,29 @@ public class MockPropMap extends UserIdentityPacket implements IJsonSerial, IDBQ
+             //return res || super.equals(s);
+         }else if(obj instanceof MockPropMap) {
+             MockPropMap map = ((MockPropMap)obj);
+-            return ((map.name != null && this.name != null) && this.name.equalsIgnoreCase(map.name)) ||
++
++            // BUG FIX: this used to be an OR - "same raw property name" OR "same settingName" was
++            // enough to be considered a match. That's fine for a simple lookup-by-either-field
++            // helper, but this is also the exact equals() used by DatabaseHelp.initDatabaseLists()'s
++            // DB_FORCE_CHECK comparison loop (see MockPropManager.forceCheckMapsDatabase(), which
++            // re-parses propmaps.json and diffs it against the existing "prop_maps" SQLite table on
++            // every app start) to decide whether a JSON-defined entry already exists in the database
++            // unchanged, or needs to be (re)inserted.
++            //
++            // A raw system property name (e.g. "ro.product.brand") essentially never changes once
++            // propmaps.json defines it - what changes over time, as propmaps.json gets edited/
++            // reorganized, is which settingName group that property is filed under. With the OR
++            // semantics, a row whose "name" still matched was ALWAYS treated as "already exists, no
++            // update needed" regardless of whether its settingName had actually changed - so any
++            // re-grouping in propmaps.json silently never reached the database. The stale old
++            // settingName mapping persisted forever after the very first install, with no error and
++            // no visible symptom other than "the JSON change doesn't seem to do anything." Since
++            // "prop_maps"."name" is the table's PRIMARY KEY and insert() already uses
++            // CONFLICT_REPLACE (see XDatabaseOld.insert()), simply requiring an exact match (both
++            // fields) here is enough: a name-only match with a different settingName now correctly
++            // falls through to the "not found -> re-insert" branch in initDatabaseLists(), which
++            // replaces the stale row via CONFLICT_REPLACE - no other file needs to change.
++            return (map.name != null && this.name != null) && this.name.equalsIgnoreCase(map.name) &&
+                     (map.settingName != null && this.settingName != null) && this.settingName.equalsIgnoreCase(map.settingName);
+         } return false;
+     }

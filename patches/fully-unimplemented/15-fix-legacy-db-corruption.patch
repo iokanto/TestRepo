@@ -1,0 +1,204 @@
+diff --git a/app/src/main/java/eu/faircode/xlua/api/xlua/XLuaDatabase.java b/app/src/main/java/eu/faircode/xlua/api/xlua/XLuaDatabase.java
+index 85a9eef..6189167 100644
+--- a/app/src/main/java/eu/faircode/xlua/api/xlua/XLuaDatabase.java
++++ b/app/src/main/java/eu/faircode/xlua/api/xlua/XLuaDatabase.java
+@@ -73,163 +73,48 @@ public class XLuaDatabase implements IInitDatabase {
+             if(!check_1) check_1 = LuaSettingsManager.forceDatabaseCheck(context, db) && LuaSettingsManager.compareJsonToDatabase(context, db);
+             DatabasePathUtil.log("XLUA init settings=" + check_1, false);
+             init = check_1;
+-            //Make a centralized core for logs
+-
+-            SQLiteDatabase _db = db.getDatabase();
+-            db.writeLock();
+-            try {
+-                if (_db.needUpgrade(1)) {
+-                    DatabasePathUtil.log("Database upgrade version 1", false);
+-                    _db.beginTransaction();
+-                    try {
+-                        _db.execSQL("CREATE TABLE assignment (package TEXT NOT NULL, uid INTEGER NOT NULL, hook TEXT NOT NULL, installed INTEGER, used INTEGER, restricted INTEGER, exception TEXT)");
+-                        _db.execSQL("CREATE UNIQUE INDEX idx_assignment ON assignment(package, uid, hook)");
+-
+-                        _db.execSQL("CREATE TABLE setting (user INTEGER, category TEXT NOT NULL, name TEXT NOT NULL, value TEXT)");
+-                        _db.execSQL("CREATE UNIQUE INDEX idx_setting ON setting(user, category, name)");
+-
+-                        _db.setVersion(1);
+-                        _db.setTransactionSuccessful();
+-                    } finally {
+-                        _db.endTransaction();
+-                    }
+-                }
+-
+-                if (_db.needUpgrade(2)) {
+-                    DatabasePathUtil.log("Database upgrade version 2", false);
+-                    _db.beginTransaction();
+-                    try {
+-                        _db.execSQL("CREATE TABLE hook (id TEXT NOT NULL, definition TEXT NOT NULL)");
+-                        _db.execSQL("CREATE UNIQUE INDEX idx_hook ON hook(id, definition)");
+-
+-                        _db.setVersion(2);
+-                        _db.setTransactionSuccessful();
+-                    } finally {
+-                        _db.endTransaction();
+-                    }
+-                }
+-
+-                if (_db.needUpgrade(3)) {
+-                    DatabasePathUtil.log("Database upgrade version 3", false);
+-                    _db.beginTransaction();
+-                    try {
+-                        _db.execSQL("ALTER TABLE assignment ADD COLUMN old TEXT");
+-                        _db.execSQL("ALTER TABLE assignment ADD COLUMN new TEXT");
+-                        _db.execSQL("CREATE INDEX idx_assignment_used ON assignment(used)");
+-
+-                        _db.setVersion(3);
+-                        _db.setTransactionSuccessful();
+-                    } finally {
+-                        _db.endTransaction();
+-                    }
+-                }
+-
+-                if (_db.needUpgrade(4)) {
+-                    DatabasePathUtil.log("Database upgrade version 4", false);
+-                    _db.beginTransaction();
+-                    try {
+-                        Map<String, XLuaHook> tmp = new HashMap<>();
+-                        Cursor cursor = null;
+-                        try {
+-                            cursor = _db.query("hook", null,
+-                                    null, null,
+-                                    null, null, null);
+-                            int colDefinition = cursor.getColumnIndex("definition");
+-                            while (cursor.moveToNext()) {
+-                                String definition = cursor.getString(colDefinition);
+-                                XLuaHook hook = new XLuaHook();
+-                                hook.fromJSONObject(new JSONObject(definition));
+-                                tmp.put(hook.getObjectId(), hook);
+-                            }
+-                        } finally {
+-                            if (cursor != null)
+-                                cursor.close();
+-                        }
+-
+-                        DatabasePathUtil.log("Converting definitions=" + tmp.size(), false);
+-
+-                        _db.execSQL("DROP INDEX idx_hook");
+-                        _db.execSQL("DELETE FROM hook");
+-                        _db.execSQL("CREATE UNIQUE INDEX idx_hook ON hook(id)");
+-
+-                        for (String id : tmp.keySet()) {
+-                            ContentValues cv = new ContentValues();
+-                            cv.put("id", id);
+-                            cv.put("definition", tmp.get(id).toJSON());
+-                            long rows = _db.insertWithOnConflict("hook", null, cv, SQLiteDatabase.CONFLICT_REPLACE);
+-                            if (rows < 0)
+-                                throw new Throwable("Error inserting hook");
+-                        }
+-
+-
+-                        _db.setVersion(4);
+-                        _db.setTransactionSuccessful();
+-                    } finally {
+-                        _db.endTransaction();
+-                    }
+-                }
+ 
+-                if (_db.needUpgrade(5)) {
+-                    DatabasePathUtil.log("Database upgrade version 5", false);
+-                    _db.beginTransaction();
+-                    try {
+-                        _db.execSQL("CREATE TABLE `group` (package TEXT NOT NULL, uid INTEGER NOT NULL, name TEXT NOT NULL, used INTEGER)");
+-                        _db.execSQL("CREATE UNIQUE INDEX idx_group ON `group`(package, uid, name)");
+-
+-                        _db.setVersion(5);
+-                        _db.setTransactionSuccessful();
+-                    } finally {
+-                        _db.endTransaction();
+-                    }
+-                }
+-
+-                if(DebugUtil.isDebug())
+-                    DatabasePathUtil.log("Renaming XLUA Hooks", false);
+-
+-                //deleteHook(_db, "Privacy.ContentResolver/query1");
+-                //deleteHook(_db, "Privacy.ContentResolver/query16");
+-                //deleteHook(_db, "Privacy.ContentResolver/query26");
+-
+-                renameHookId(_db, "TelephonyManager/getDeviceId", "TelephonyManager.getDeviceId");
+-                renameHookId(_db, "TelephonyManager/getDeviceId/slot", "TelephonyManager.getDeviceId/slot");
+-                renameHookId(_db, "TelephonyManager/getGroupIdLevel1", "TelephonyManager.getGroupIdLevel1");
+-                renameHookId(_db, "TelephonyManager/getImei", "TelephonyManager.getImei");
+-                renameHookId(_db, "TelephonyManager/getImei/slot", "TelephonyManager.getImei/slot");
+-                renameHookId(_db, "TelephonyManager/getLine1Number", "TelephonyManager.getLine1Number");
+-                renameHookId(_db, "TelephonyManager/getMeid", "TelephonyManager.getMeid");
+-                renameHookId(_db, "TelephonyManager/getMeid/slot", "TelephonyManager.getMeid/slot");
+-                renameHookId(_db, "TelephonyManager/getNetworkSpecifier", "TelephonyManager.getNetworkSpecifier");
+-                renameHookId(_db, "TelephonyManager/getSimSerialNumber", "TelephonyManager.getSimSerialNumber");
+-                renameHookId(_db, "TelephonyManager/getSubscriberId", "TelephonyManager.getSubscriberId");
+-                renameHookId(_db, "TelephonyManager/getVoiceMailAlphaTag", "TelephonyManager.getVoiceMailAlphaTag");
+-                renameHookId(_db, "TelephonyManager/getVoiceMailNumber", "TelephonyManager.getVoiceMailNumber");
+-                renameHookId(_db, "Settings.Secure.getString", "Settings.Secure.getString/android_id");
+-                renameHookId(_db, "SystemProperties.get", "SystemProperties.get/serial");
+-                renameHookId(_db, "SystemProperties.get/default", "SystemProperties.get.default/serial");
+-
+-                if(DebugUtil.isDebug())
+-                    DatabasePathUtil.log("Database version=" + _db.getVersion(), false);
+-
+-                // Reset usage data
+-                ContentValues cv = new ContentValues();
+-                cv.put("installed", -1);
+-                cv.putNull("exception");
+-                long rows = _db.update("assignment", cv, null, null);
+-                if(DebugUtil.isDebug())
+-                    DatabasePathUtil.log("Reset assigned hook data count=" + rows, false);
+-
+-            } catch (Throwable ex) {
+-                DatabasePathUtil.log("DB EXCEPTION=" + ex + "\n" + Log.getStackTraceString(ex), true);
+-            } finally {
+-                db.writeUnlock();// first lock is the bug
+-            }
+-
+-            initHooks(db, context);
++            // CRITICAL BUG FIX: this whole block used to unconditionally run a full legacy
++            // schema-upgrade cascade (_db.needUpgrade(1) through (5), each ending in
++            // _db.setVersion(N)) plus a destructive, WHERE-less "UPDATE assignment SET
++            // installed=-1, exception=NULL" against this SAME physical database file.
++            //
++            // This class (XLuaDatabase, via the old XDatabaseOld wrapper) and the modern hook/
++            // assignment system (SQLDatabase, via x.xlua.database.wrappers.XLuaDatabaseManager,
++            // used by GlobalCommandBridge for virtually everything the UI does day-to-day) both
++            // resolve to the exact same on-disk file: DatabasePathUtil.getDatabaseDirectory(context)
++            // + "/xlua.db" - both database utility classes were pointed at that one rootless-safe
++            // directory when patch 01 fixed them, and neither was ever made aware of the other.
++            //
++            // This legacy path was effectively dead code for years: nothing ever exercised it,
++            // because every "xlua"-prefixed call from XPL-EX's own UI is served by
++            // GlobalCommandBridge's in-process fast path (see XProxyContent.isSelfPackage()), and
++            // XCommandBridgeStatic/this class are only reached as a cross-process fallback for a
++            // command that isn't registered on the modern bridge - which, before the "Prop Values"
++            // screen was reachable, never happened. GetMockSettingsCommand (used by the Prop Values
++            // screen's setting-value display) is registered only on XCommandBridgeStatic's OLD
++            // luaCommandService, not on the modern GlobalCommandBridge - so opening Prop Values is
++            // what finally, for the first time, triggers this class's lazy init.
++            //
++            // The result: _db.needUpgrade(1) sees the shared file's SQLite user_version at its
++            // default of 0 (the modern system never touches that pragma at all - grep confirms
++            // SQLDatabase.java has no needUpgrade/setVersion/getVersion calls anywhere), so this
++            // legacy code thinks it's a brand new, empty database and runs its own independent
++            // CREATE TABLE / CREATE INDEX statements - against a file that already has real,
++            // modern, in-use data - and unconditionally wipes every row of the (legacy, distinct
++            // table but same file) "assignment" table's installed/exception columns. None of this
++            // is needed anymore: the modern system already owns table creation and migration for
++            // this file end to end (see SettingReMappedItem's OLD_TABLE_NAME/NEW_TABLE_NAME for the
++            // one migration path that's actually still relevant), so this entire legacy cascade -
++            // schema upgrades, hook-id renames, and the destructive assignment reset - has been
++            // removed rather than left to fire unpredictably whenever a legacy-only command
++            // happens to be the one that gets called.
+         }
+ 
+         return init;
+     }
+ 
++
+     public void initHooks(XDatabaseOld db, Context context) {
+ 
+         try {

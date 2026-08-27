@@ -1,0 +1,25 @@
+diff --git a/app/src/main/java/eu/faircode/xlua/ActivityMain.java b/app/src/main/java/eu/faircode/xlua/ActivityMain.java
+index 06dab36..1d9b051 100644
+--- a/app/src/main/java/eu/faircode/xlua/ActivityMain.java
++++ b/app/src/main/java/eu/faircode/xlua/ActivityMain.java
+@@ -321,6 +321,20 @@ public class ActivityMain extends ActivityBase {
+             }
+         }));
+ 
++        // BUG FIX: this entry was completely missing - menuProps() / ActivityProperties (the
++        // device-property/User-Agent spoofing screen backed by propmaps.json + the "prop_maps" /
++        // "prop_settings" database tables) was fully implemented and functional, but nothing in
++        // the drawer ever called menuProps(), so the screen was permanently unreachable from the
++        // UI. R.string.menu_props ("Prop Values") already existed and is even reused as this
++        // activity's own <activity android:label> in AndroidManifest.xml - it was just never wired
++        // up as a drawer entry.
++        drawerArray.add(new DrawerItem(this, R.string.menu_props, new DrawerItem.IListener() {
++            @Override
++            public void onClick(DrawerItem item) {
++                menuProps();
++            }
++        }));
++
+         drawerArray.add(new DrawerItem(this, R.string.menu_hooks, new DrawerItem.IListener() {
+             @Override
+             public void onClick(DrawerItem item) {

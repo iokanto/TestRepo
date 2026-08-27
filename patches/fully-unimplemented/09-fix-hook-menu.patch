@@ -1,0 +1,69 @@
+diff --git a/app/src/main/java/eu/faircode/xlua/ApplicationEx.java b/app/src/main/java/eu/faircode/xlua/ApplicationEx.java
+index 2c2653e..e2cffae 100644
+--- a/app/src/main/java/eu/faircode/xlua/ApplicationEx.java
++++ b/app/src/main/java/eu/faircode/xlua/ApplicationEx.java
+@@ -29,14 +29,41 @@ import java.util.Locale;
+ 
+ public class ApplicationEx extends Application {
+     private static final String TAG = "XLua.App";
++    private static Context appContext;
++
++    /**
++     * Used by AppAssignmentsMap.get(SettingsContainer) (and anywhere else that doesn't have a
++     * Context handy) instead of hardcoding null - see fix note there for why that mattered.
++     */
++    public static Context getAppContext() { return appContext; }
+ 
+     @Override
+     public void onCreate() {
+         //setLocale();
+         super.onCreate();
+         //setLocale();
++        appContext = getApplicationContext();
+         Log.i(TAG, "Create version=" + BuildConfig.VERSION_NAME);
+         Log.w(TAG, "SHA1 Fingerprint For [" + XCommandBridgeStatic.PRO_PACKAGE + "] package equals=[" + XSecurity.getProFingerPrint(getApplicationContext()) + "]");
++
++        // BUG FIX: the "hook menu" (hook_white24) button next to each Setting Values container was
++        // effectively dead on first use. AppAssignmentsMap.get(SettingsContainer) always called
++        // info.refreshSettingAssignmentsFromMap(null, settings) with a hardcoded null Context, which
++        // means HooksSettingsGlobal.init(context) (which builds the settings-name -> hook-id map
++        // from each hook's own "settings" list) always no-op'd on that path. The empty result then
++        // got cached in AppAssignmentsMap's assignmentCache, so the button's own click handler
++        // (which checks getCount() < 1 before opening the assign-hooks dialog) always found count=0
++        // and showed a "no hooks" error instead of opening - and since the dialog never opened, the
++        // dialog-close callback that *would* have retried with a real Context never fired either.
++        // A chicken-and-egg deadlock. Warming HooksSettingsGlobal up here, once, with a real
++        // application Context, before any UI can reach that code path, avoids it entirely.
++        new Thread(() -> {
++            try {
++                eu.faircode.xlua.x.xlua.hook.HooksSettingsGlobal.init(appContext);
++            } catch (Throwable e) {
++                Log.e(TAG, "Failed to pre-initialize HooksSettingsGlobal", e);
++            }
++        }, "HooksSettingsGlobal-init").start();
+     }
+ 
+     @Override
+diff --git a/app/src/main/java/eu/faircode/xlua/x/xlua/hook/AppAssignmentsMap.java b/app/src/main/java/eu/faircode/xlua/x/xlua/hook/AppAssignmentsMap.java
+index 3d07d13..0e78b1f 100644
+--- a/app/src/main/java/eu/faircode/xlua/x/xlua/hook/AppAssignmentsMap.java
++++ b/app/src/main/java/eu/faircode/xlua/x/xlua/hook/AppAssignmentsMap.java
+@@ -57,7 +57,17 @@ public class AppAssignmentsMap {
+             AppAssignmentInfo info = internalGetFirst(settings);
+             if(info == null) {
+                 info = AppAssignmentInfo.create(container.getName(), app, this);
+-                info.refreshSettingAssignmentsFromMap(null, settings);
++                // BUG FIX: this used to hardcode null here. AppAssignmentsMap.get() has no Context
++                // parameter to thread through, but refreshSettingAssignmentsFromMap(context, ...)
++                // needs a real one to let HooksSettingsGlobal.init(context) actually populate its
++                // settings-name -> hook-id map (built from each hook's own "settings" list) the
++                // first time it's called - with null it always no-op'd, and the resulting empty
++                // AppAssignmentInfo got cached here permanently (see assignmentCache.put below),
++                // which is exactly why the "hook menu" button (checks getCount() < 1 before opening
++                // the assign-hooks dialog) looked completely dead. ApplicationEx now also warms
++                // HooksSettingsGlobal up on startup so this should rarely even be the first caller,
++                // but falling back to a real context here (rather than null) closes the gap for good.
++                info.refreshSettingAssignmentsFromMap(eu.faircode.xlua.ApplicationEx.getAppContext(), settings);
+                 for(String name : settings)
+                     this.assignmentCache.put(name, info);
+             }

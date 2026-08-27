@@ -1,0 +1,126 @@
+diff --git a/app/src/main/java/eu/faircode/xlua/api/XProxyContent.java b/app/src/main/java/eu/faircode/xlua/api/XProxyContent.java
+index 5ca97d8..d3022b3 100644
+--- a/app/src/main/java/eu/faircode/xlua/api/XProxyContent.java
++++ b/app/src/main/java/eu/faircode/xlua/api/XProxyContent.java
+@@ -5,6 +5,7 @@ import android.database.Cursor;
+ import android.os.Bundle;
+ import android.util.Log;
+ 
++import eu.faircode.xlua.DebugUtil;
+ import eu.faircode.xlua.api.xstandard.database.SqlQuerySnake;
+ import eu.faircode.xlua.x.Str;
+ import eu.faircode.xlua.x.xlua.LibUtil;
+@@ -67,6 +68,16 @@ public class XProxyContent {
+         }
+     }
+ 
++    // BUG FIX: on a cold target-app launch, HookCore.initHooks() (running inside the freshly
++    // patched target app's Application.onCreate) races the ":vxp" ContentProvider process spawn.
++    // The very first Binder call can throw or return null before the provider is even registered,
++    // and there was previously no retry - the target app would silently boot with zero loaded hook
++    // assignments for its entire process lifetime (hooks are only read once at startup, see
++    // HookRefreshUtil). A short bounded retry with backoff covers the startup race without masking
++    // genuine, persistent failures (which still return null after MAX_ATTEMPTS and get logged).
++    private static final int MAX_PROVIDER_ATTEMPTS = 3;
++    private static final long PROVIDER_RETRY_BASE_DELAY_MS = 150L;
++
+     public static Cursor invokeQuery(Context context,String handler, String method) { return invokeQuery(context, handler, method, null, null); }
+     public static Cursor invokeQuery(Context context,String handler, String method, String[] args_selection) { return invokeQuery(context, handler, method, args_selection, null); }
+     public static Cursor invokeQuery(Context context,String handler, String method, String[] args_selection, String selection) {
+@@ -76,24 +87,36 @@ public class XProxyContent {
+                 if (result != null)
+                     return result;
+             } catch (Throwable e) {
+-                Log.e(TAG, "Direct in-process query failed! handler=" + handler + " method=" + method + " e=" + e + "\n" + Log.getStackTraceString(e));
++                if (DebugUtil.isDebug())
++                    Log.e(TAG, "Direct in-process query failed! handler=" + handler + " method=" + method + " e=" + e, e);
+             }
+         }
+ 
+         // Real cross-process ContentResolver call. Always used when this is a target app's hooked
+-        // process calling in (not XPL-EX itself), and as a fallback otherwise.
+-        try {
+-            return context.getContentResolver()
+-                    .query(
+-                            eu.faircode.xlua.XSecurity.getURI(),
+-                            new String[]{ handler + "." + method },
+-                            selection,
+-                            args_selection,
+-                            null);
+-        }catch (Exception e) {
+-            Log.e(TAG, "Failed to Invoke Query! handler=" + handler + " method=" + method + " e=" + e + "\n" + Log.getStackTraceString(e));
+-            return null;
++        // process calling in (not XPL-EX itself), and as a fallback otherwise. Retried a few times
++        // to absorb the ":vxp" provider startup race described above.
++        for (int attempt = 1; attempt <= MAX_PROVIDER_ATTEMPTS; attempt++) {
++            try {
++                Cursor result = context.getContentResolver()
++                        .query(
++                                eu.faircode.xlua.XSecurity.getURI(),
++                                new String[]{ handler + "." + method },
++                                selection,
++                                args_selection,
++                                null);
++                if (result != null)
++                    return result;
++            } catch (Exception e) {
++                if (DebugUtil.isDebug())
++                    Log.w(TAG, "vxp provider query attempt " + attempt + "/" + MAX_PROVIDER_ATTEMPTS +
++                            " failed! handler=" + handler + " method=" + method + " e=" + e);
++            }
++            if (attempt < MAX_PROVIDER_ATTEMPTS)
++                sleepQuietly(PROVIDER_RETRY_BASE_DELAY_MS * attempt);
+         }
++
++        Log.e(TAG, "Failed to Invoke Query after " + MAX_PROVIDER_ATTEMPTS + " attempts! handler=" + handler + " method=" + method);
++        return null;
+     }
+ 
+     public static Bundle invokeCall(Context context, String handler, String method) { return invokeCall(context,handler, method, new Bundle()); }
+@@ -104,16 +127,40 @@ public class XProxyContent {
+                 if (result != null)
+                     return result;
+             } catch (Throwable e) {
+-                Log.e(TAG, "Direct in-process call failed! handler=" + handler + " method=" + method + " e=" + e + "\n" + Log.getStackTraceString(e));
++                if (DebugUtil.isDebug())
++                    Log.e(TAG, "Direct in-process call failed! handler=" + handler + " method=" + method + " e=" + e, e);
+             }
+         }
+ 
++        // Same provider-startup race as invokeQuery() above - retry with backoff before failing.
++        for (int attempt = 1; attempt <= MAX_PROVIDER_ATTEMPTS; attempt++) {
++            try {
++                Bundle result = context.getContentResolver()
++                        .call(eu.faircode.xlua.XSecurity.getURI(), handler, method, extras);
++                if (result != null)
++                    return result;
++            } catch (Exception e) {
++                if (DebugUtil.isDebug())
++                    Log.w(TAG, "vxp provider call attempt " + attempt + "/" + MAX_PROVIDER_ATTEMPTS +
++                            " failed! handler=" + handler + " method=" + method + " e=" + e);
++            }
++            if (attempt < MAX_PROVIDER_ATTEMPTS)
++                sleepQuietly(PROVIDER_RETRY_BASE_DELAY_MS * attempt);
++        }
++
++        Log.e(TAG, "Failed to Invoke Call after " + MAX_PROVIDER_ATTEMPTS + " attempts! handler=" + handler + " method=" + method);
++        return null;
++    }
++
++    // NOTE: this must only ever run off the main/UI thread. HookCore.initHooks() (the caller inside
++    // every hooked target app) already runs during hook installation, not on the UI thread; do not
++    // add retrying calls to this method from any UI-thread caller without moving that caller to a
++    // background thread first, or the app will ANR.
++    private static void sleepQuietly(long millis) {
+         try {
+-            return context.getContentResolver()
+-                    .call(eu.faircode.xlua.XSecurity.getURI(), handler, method, extras);
+-        }catch (Exception e) {
+-            Log.e(TAG, "Failed to Invoke Call! handler=" + handler + " method=" + method + " e=" + e + "\n" + Log.getStackTraceString(e));
+-            return null;
++            Thread.sleep(millis);
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
+         }
+     }
+ }
